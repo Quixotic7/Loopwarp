@@ -66,6 +66,9 @@ function GridSequencer.new(options)
   self.manual_region = nil
   self.seq_metro = nil
   self.next_step_time = nil
+  self.seq_remaining_time = nil
+  self.current_region_start = nil
+  self.current_region_end = nil
   self.g.key = function(x, y, z) self:key(x, y, z) end
   return self
 end
@@ -102,21 +105,57 @@ function GridSequencer:base_region()
   return 0, 128
 end
 
+function GridSequencer:region_is_current(start_point, end_point)
+  return self.current_region_start ~= nil
+    and math.abs(self.current_region_start - start_point) < 0.0001
+    and math.abs(self.current_region_end - end_point) < 0.0001
+end
+
+function GridSequencer:mark_region_current(start_point, end_point)
+  self.current_region_start = start_point
+  self.current_region_end = end_point
+end
+
 function GridSequencer:set_region(start_point, end_point)
+  if self:region_is_current(start_point, end_point) then
+    return
+  end
   if self.options.set_loop_region ~= nil then
     self.options.set_loop_region(start_point, end_point)
   end
+  self:mark_region_current(start_point, end_point)
 end
 
 function GridSequencer:set_region_and_phase(start_point, end_point)
   if self.options.set_loop_region ~= nil then
     self.options.set_loop_region(start_point, end_point, true)
   end
+  self:mark_region_current(start_point, end_point)
+end
+
+function GridSequencer:set_region_with_phase(start_point, end_point, phase)
+  if self.options.set_loop_region ~= nil then
+    self.options.set_loop_region(start_point, end_point, phase)
+  end
+  self:mark_region_current(start_point, end_point)
 end
 
 function GridSequencer:reset_region()
   local start_point, end_point = self:base_region()
   self:set_region(start_point, end_point)
+end
+
+function GridSequencer:phase_for_position(start_point, end_point, position)
+  local range = math.max(0.01, end_point - start_point)
+  return ((position - start_point) / range) % 1
+end
+
+function GridSequencer:position_at_region(start_point, end_point, at_time)
+  if self.options.position_at_region ~= nil then
+    return self.options.position_at_region(start_point, end_point, at_time)
+  end
+  local phase = self.options.phase ~= nil and (self.options.phase() or 0) or 0
+  return start_point + ((end_point - start_point) * phase)
 end
 
 function GridSequencer:loop_region_from_holds(holds)
@@ -176,16 +215,39 @@ function GridSequencer:first_held_step()
   return nil
 end
 
-function GridSequencer:apply_current_region()
+function GridSequencer:apply_current_region(reset_locked_step, restore_position)
   if self.manual_region ~= nil then
     return
   end
 
   local lock = self:step_lock(self.play_page, self.play_step)
   if self.playing and lock ~= nil then
-    self:set_region(lock.start_point, lock.end_point)
+    if reset_locked_step then
+      self:set_region_and_phase(lock.start_point, lock.end_point)
+    else
+      self:set_region(lock.start_point, lock.end_point)
+    end
   else
-    self:reset_region()
+    local start_point, end_point = self:base_region()
+    if restore_position ~= nil then
+      self:set_region_with_phase(start_point, end_point, self:phase_for_position(start_point, end_point, restore_position))
+    else
+      self:set_region(start_point, end_point)
+    end
+  end
+end
+
+function GridSequencer:start_current_region()
+  if self.manual_region ~= nil then
+    return
+  end
+
+  local lock = self:step_lock(self.play_page, self.play_step)
+  if self.playing and lock ~= nil then
+    self:set_region_and_phase(lock.start_point, lock.end_point)
+  else
+    local start_point, end_point = self:base_region()
+    self:set_region_with_phase(start_point, end_point, 0)
   end
 end
 
@@ -250,17 +312,38 @@ function GridSequencer:ensure_sequence_metro()
   return self.seq_metro
 end
 
-function GridSequencer:start_sequence()
-  self:stop_sequence()
+function GridSequencer:start_sequence(reset_sequence)
+  if self.seq_metro ~= nil then
+    self.seq_metro:stop()
+  end
   self.playing = true
-  self.play_page = self:first_loop_page()
-  self.play_step = 1
-  self:apply_current_region()
-  self.next_step_time = util.time() + self:step_seconds()
+  if self.seq_remaining_time ~= nil and not reset_sequence then
+    self.next_step_time = util.time() + self.seq_remaining_time
+    self.seq_remaining_time = nil
+    self:apply_current_region(false)
+  else
+    self.seq_remaining_time = nil
+    self.play_page = self:first_loop_page()
+    self.play_step = 1
+    self:start_current_region()
+    self.next_step_time = util.time() + self:step_seconds()
+  end
   local seq_metro = self:ensure_sequence_metro()
   if seq_metro ~= nil then
     seq_metro:start(self:metro_interval(), -1)
   end
+  self:request_redraw()
+end
+
+function GridSequencer:pause_sequence()
+  self.playing = false
+  if self.seq_metro ~= nil then
+    self.seq_metro:stop()
+  end
+  if self.next_step_time ~= nil then
+    self.seq_remaining_time = math.max(0.001, self.next_step_time - util.time())
+  end
+  self.next_step_time = nil
   self:request_redraw()
 end
 
@@ -270,17 +353,21 @@ function GridSequencer:stop_sequence()
     self.seq_metro:stop()
   end
   self.next_step_time = nil
+  self.seq_remaining_time = nil
   self.play_step = 1
   self.play_page = self:first_loop_page()
-  self:reset_region()
+  local start_point, end_point = self:base_region()
+  self:set_region_with_phase(start_point, end_point, 0)
   self:request_redraw()
 end
 
-function GridSequencer:set_transport(playing)
+function GridSequencer:set_transport(playing, reset_sequence)
   if playing then
-    self:start_sequence()
-  else
+    self:start_sequence(reset_sequence == true)
+  elseif reset_sequence then
     self:stop_sequence()
+  else
+    self:pause_sequence()
   end
 end
 
@@ -316,12 +403,27 @@ function GridSequencer:tick_sequence()
 end
 
 function GridSequencer:advance_step()
+  local prev_lock = self.playing and self:step_lock(self.play_page, self.play_step) or nil
+  local restore_position = nil
+  if prev_lock ~= nil then
+    restore_position = self:position_at_region(
+      prev_lock.start_point,
+      prev_lock.end_point,
+      self.next_step_time or util.time()
+    )
+  end
+
   self.play_step = self.play_step + 1
   if self.play_step > 16 then
     self.play_step = 1
     self.play_page = self:next_loop_page(self.play_page)
   end
-  self:apply_current_region()
+
+  local lock = self:step_lock(self.play_page, self.play_step)
+  if lock ~= nil then
+    restore_position = nil
+  end
+  self:apply_current_region(true, restore_position)
   self:request_redraw()
 end
 
@@ -413,11 +515,11 @@ function GridSequencer:key_controls(x, z)
     self:message(self.recording and "Record On" or "Record Off")
   elseif z == 1 and x == 4 then
     if self.options.set_playing ~= nil then
-      self.options.set_playing(true)
+      self.options.set_playing(not self.playing, false)
     end
   elseif z == 1 and x == 5 then
     if self.options.set_playing ~= nil then
-      self.options.set_playing(false)
+      self.options.set_playing(false, true)
     end
   end
 end

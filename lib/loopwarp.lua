@@ -214,15 +214,35 @@ function loopwarp.play(state)
   set_engine_play(state and 1 or 0)
 end
 
+function loopwarp.stop_reset()
+  flush_engine_sends()
+  if engine.stopAndReset ~= nil then
+    engine_call("stopAndReset")
+  elseif engine.stop ~= nil then
+    engine_call("stop")
+  else
+    engine_call("play", 0)
+    engine_call("playhead", 0)
+  end
+end
+
 function loopwarp.request_status()
   engine_call("requestStatus")
 end
 
 function loopwarp.set_loop_region(start_point, end_point, reset_playhead)
   flush_engine_sends()
+  if reset_playhead ~= nil and engine.loopRegionPlayhead ~= nil then
+    local phase = type(reset_playhead) == "number" and reset_playhead or 0
+    engine_call("loopRegionPlayhead", start_point, end_point, phase)
+    return
+  end
+
   engine_call("loopStart", start_point)
   engine_call("loopEnd", end_point)
-  if reset_playhead then
+  if type(reset_playhead) == "number" then
+    engine_call("playhead", reset_playhead)
+  elseif reset_playhead then
     engine_call("playhead", 0)
   end
 end

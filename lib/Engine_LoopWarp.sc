@@ -174,8 +174,8 @@ Engine_LoopWarp : CroneEngine {
 			var pitchSmooth, sliceWidth, sliceStart, localPhase, forwardStop, loopForward, pingPong, pingPongPhase, stepRate, stopGate;
 			phase = In.ar(phaseBus, 1);
 			frames = BufFrames.kr(bufL).max(4);
-			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.02);
-			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.02);
+			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.002);
+			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.002);
 			readPhase = (startNorm + (phase * range)).clip(0, 0.999999);
 			beatDur = 60 / targetBpm.max(1);
 			trig = Impulse.ar(((targetBpm.max(1) / 60) / chopBeats.max(0.03125)).max(0.1));
@@ -218,8 +218,8 @@ Engine_LoopWarp : CroneEngine {
 			var phase, frames, pos, dur, randomness, direct, wet, sig, modeGain, playGate, gainNorm, startNorm, range, readPhase, stepDur, overlap, overlapControl;
 			phase = In.ar(phaseBus, 1);
 			frames = BufFrames.kr(bufL).max(4);
-			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.02);
-			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.02);
+			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.002);
+			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.002);
 			readPhase = (startNorm + (phase * range)).clip(0, 0.999999);
 			pos = readPhase * (frames - 1);
 			dur = Lag.kr(grainSize.clip(0.02, 0.5), 0.05);
@@ -255,8 +255,8 @@ Engine_LoopWarp : CroneEngine {
 			var phase, frames, trig, dur, rate, chaos, pos, offset, direct, wet, sig, modeGain, playGate, gainNorm, startNorm, range, readPhase, stepDur, overlapControl, wanderControl;
 			phase = In.ar(phaseBus, 1);
 			frames = BufFrames.kr(bufL).max(4);
-			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.02);
-			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.02);
+			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.002);
+			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.002);
 			readPhase = (startNorm + (phase * range)).clip(0, 0.999999);
 			dur = Lag.kr(grainSize.clip(0.03, 0.6), 0.05);
 			stepDur = 15 / targetBpm.max(1);
@@ -295,8 +295,8 @@ Engine_LoopWarp : CroneEngine {
 			var phase, frames, pos, raw, shifted, ratio, sig, modeGain, playGate, window, startNorm, range, readPhase;
 			phase = In.ar(phaseBus, 1);
 			frames = BufFrames.kr(bufL).max(4);
-			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.02);
-			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.02);
+			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.002);
+			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.002);
 			readPhase = (startNorm + (phase * range)).clip(0, 0.999999);
 			pos = readPhase * (frames - 1);
 			raw = [
@@ -327,8 +327,8 @@ Engine_LoopWarp : CroneEngine {
 			var phase, frames, sourcePhase, pos, sig, modeGain, playGate, pitchRatio, startNorm, range, nativeIncrement;
 			frames = BufFrames.kr(bufL).max(4);
 			pitchRatio = Lag.kr(pitch, 0.03).midiratio.clip(0.03125, 32);
-			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.02);
-			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.02);
+			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.002);
+			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.002);
 			if(modeId == 0, {
 				nativeIncrement = (BufRateScale.kr(bufL) * speed.max(0.03125) * pitchRatio) / (frames * range).max(1);
 				phase = Phasor.ar(resetTrig, nativeIncrement * playing.clip(0, 1), 0, 1, resetPos.clip(0, 0.999999));
@@ -403,6 +403,7 @@ Engine_LoopWarp : CroneEngine {
 		this.addCommand(\targetBpm, "f", { arg msg; targetBpm = msg[1].max(1); this.updateTransport; this.setActive(\targetBpm, targetBpm); });
 		this.addCommand(\loopStart, "f", { arg msg; this.setLoopStart(msg[1]); });
 		this.addCommand(\loopEnd, "f", { arg msg; this.setLoopEnd(msg[1]); });
+		this.addCommand(\loopRegionPlayhead, "fff", { arg msg; this.setLoopRegionPlayhead(msg[1], msg[2], msg[3]); });
 		this.addCommand(\xfade, "f", { arg msg; loopXfade = msg[1].clip(0, 0.25); });
 		this.addCommand(\chopSteps, "f", { arg msg; this.setActive(\chopBeats, msg[1].max(0.03125) / 4); });
 		this.addCommand(\chopBeats, "f", { arg msg; this.setActive(\chopBeats, msg[1]); });
@@ -527,6 +528,36 @@ Engine_LoopWarp : CroneEngine {
 		this.setActive(\loopBeats, this.activeLoopBeats);
 		this.setActive(\startPoint, loopStart);
 		this.setActive(\endPoint, loopEnd);
+	}
+
+	setLoopRegionPlayhead { arg startPosition, endPosition, phase;
+		loopStart = startPosition.clip(0, 127.99);
+		loopEnd = endPosition.clip(0.01, 128);
+		if(loopEnd <= loopStart, { loopEnd = (loopStart + 0.01).clip(0.01, 128); });
+		resetCount = resetCount + 1;
+		lastPhase = phase.wrap(0, 1);
+		if(transportSynth.notNil, {
+			transportSynth.set(
+				\playing, playing,
+				\targetBpm, targetBpm,
+				\loopBeats, this.activeLoopBeats,
+				\correction, correction,
+				\resetPos, lastPhase,
+				\resetTrig, resetCount
+			);
+		});
+		if(activeSynth.notNil, {
+			activeSynth.set(
+				\playing, playing,
+				\targetBpm, targetBpm,
+				\loopBeats, this.activeLoopBeats,
+				\startPoint, loopStart,
+				\endPoint, loopEnd,
+				\resetPos, lastPhase,
+				\resetTrig, resetCount
+			);
+		});
+		scriptAddress.sendBundle(0, ["/loopwarp/reset", lastPhase]);
 	}
 
 	updateTransport {

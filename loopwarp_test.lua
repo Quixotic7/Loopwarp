@@ -256,6 +256,18 @@ local function visible_message()
   return ui_message
 end
 
+local function pset_path(n)
+  return norns.state.data .. norns.state.shortname .. "-" .. string.format("%02d", n) .. ".pset"
+end
+
+local function load_startup_pset()
+  local path = pset_path(1)
+  if util.file_exists(path) then
+    print("loopwarp: loading startup pset 1")
+    params:read(1)
+  end
+end
+
 local function status_message()
   if grid_ui ~= nil and grid_ui.screen_status ~= nil then
     return grid_ui:screen_status() or visible_message()
@@ -297,6 +309,19 @@ local function display_phase()
   return (phase + (elapsed * loop_phase_rate(start_point, end_point))) % 1
 end
 
+local function position_at_region(start_point, end_point, at_time)
+  local elapsed = (at_time or util.time()) - (status.phase_time or util.time())
+  local unwrapped = (status.phase or 0) + (elapsed * loop_phase_rate(start_point, end_point))
+  local nearest = math.floor(unwrapped + 0.5)
+  local phase
+  if nearest == 1 and math.abs(unwrapped - nearest) < 0.01 then
+    phase = 1
+  else
+    phase = unwrapped % 1
+  end
+  return start_point + ((end_point - start_point) * phase)
+end
+
 local function draw_playhead(y)
   local x0 = 4
   local x1 = 124
@@ -325,14 +350,28 @@ local function draw_playhead(y)
   screen.stroke()
 end
 
-local function set_playing(state)
+local function set_playing(state, reset_transport)
+  reset_transport = reset_transport == true
+  local frozen_phase = playing and display_phase() or status.phase
   playing = state
+  if reset_transport then
+    status.phase = 0
+  elseif not playing then
+    status.phase = frozen_phase
+  end
   status.phase_time = util.time()
   params:set(id("play"), playing and 1 or 0, true)
   print("loopwarp: K3/play state " .. tostring(playing and 1 or 0))
-  loopwarp.play(playing)
+  if not reset_transport then
+    loopwarp.play(playing)
+  end
   if grid_ui ~= nil then
-    grid_ui:set_transport(playing)
+    grid_ui:set_transport(playing, reset_transport)
+  end
+  if reset_transport then
+    loopwarp.stop_reset()
+    status.phase = 0
+    status.phase_time = util.time()
   end
   request_redraw()
 end
@@ -342,7 +381,7 @@ local function load_file(path)
   browsing = false
   if path ~= "cancel" then
     save_browser_folder(parent_folder(path))
-    set_playing(false)
+    set_playing(false, true)
     params:set(id("sample"), path)
   end
   request_redraw()
@@ -350,7 +389,7 @@ end
 
 local function select_sample()
   local folder = browser_folder()
-  set_playing(false)
+  set_playing(false, true)
   browsing = true
   if folder_starts_with(folder, _path.dust) then
     fileselect.enter(_path.dust, load_file, "audio")
@@ -388,12 +427,16 @@ function init()
     name = "loopwarp test",
     clock_sync = false
   })
+  load_startup_pset()
   load_browser_folder()
   grid_ui = GridSequencer.new({
     set_playing = set_playing,
     set_loop_region = function(start_point, end_point, reset_playhead)
       loopwarp.set_loop_region(start_point, end_point, reset_playhead)
-      if reset_playhead then
+      if type(reset_playhead) == "number" then
+        status.phase = reset_playhead
+        status.phase_time = util.time()
+      elseif reset_playhead then
         status.phase = 0
         status.phase_time = util.time()
       end
@@ -405,6 +448,7 @@ function init()
       return params:get(id("target_bpm"))
     end,
     phase = display_phase,
+    position_at_region = position_at_region,
     show_message = show_message,
     request_redraw = request_redraw
   })
@@ -416,8 +460,10 @@ function init()
         print("loopwarp: osc " .. path .. " " .. format_args(args))
       end
       if path == "/loopwarp/status" then
-        status.phase = tonumber(args[5]) or status.phase
-        status.phase_time = util.time()
+        if not playing then
+          status.phase = tonumber(args[5]) or status.phase
+          status.phase_time = util.time()
+        end
         status.frames = tonumber(args[6]) or status.frames
         status.amp_l = tonumber(args[7]) or status.amp_l
         status.amp_r = tonumber(args[8]) or status.amp_r
@@ -426,11 +472,15 @@ function init()
           params:set(id("source_bpm"), status.derived_bpm, true)
         end
       elseif path == "/loopwarp/transport" then
-        status.phase = tonumber(args[1]) or status.phase
-        status.phase_time = util.time()
+        if not playing then
+          status.phase = tonumber(args[1]) or status.phase
+          status.phase_time = util.time()
+        end
       elseif path == "/loopwarp/requestedStatus" then
-        status.phase = tonumber(args[4]) or status.phase
-        status.phase_time = util.time()
+        if not playing then
+          status.phase = tonumber(args[4]) or status.phase
+          status.phase_time = util.time()
+        end
         status.frames = tonumber(args[5]) or status.frames
         status.derived_bpm = tonumber(args[8]) or status.derived_bpm
         if status.derived_bpm > 0 then
@@ -448,7 +498,7 @@ function init()
     end
   end
 
-  set_playing(false)
+  set_playing(false, true)
   start_redraw_metro()
   redraw()
 end
@@ -471,7 +521,7 @@ function key(n, z)
   elseif n == 2 then
     select_sample()
   elseif n == 3 then
-    set_playing(not playing)
+    set_playing(not playing, false)
   end
 
   request_redraw()
