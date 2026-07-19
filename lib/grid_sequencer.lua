@@ -64,16 +64,17 @@ function GridSequencer.new(options)
   self.rate_index = 4
   self.step_locks = {}
   self.manual_region = nil
-  self.seq_clock = nil
+  self.seq_metro = nil
+  self.next_step_time = nil
   self.g.key = function(x, y, z) self:key(x, y, z) end
   return self
 end
 
 function GridSequencer:cleanup()
   self.playing = false
-  if self.seq_clock ~= nil then
-    clock.cancel(self.seq_clock)
-    self.seq_clock = nil
+  if self.seq_metro ~= nil then
+    self.seq_metro:stop()
+    self.seq_metro = nil
   end
   if self.g ~= nil then
     self.g:all(0)
@@ -222,27 +223,53 @@ function GridSequencer:current_rate()
   return RATES[self.rate_index] or 1
 end
 
+function GridSequencer:current_bpm()
+  if self.options.get_tempo ~= nil then
+    return math.max(1, self.options.get_tempo() or 120)
+  end
+  if clock.get_tempo ~= nil then
+    return math.max(1, clock.get_tempo())
+  end
+  return 120
+end
+
+function GridSequencer:step_seconds()
+  return 60 / self:current_bpm() / 4 / self:current_rate()
+end
+
+function GridSequencer:metro_interval()
+  return util.clamp(self:step_seconds() / 2, 0.005, 0.05)
+end
+
+function GridSequencer:ensure_sequence_metro()
+  if self.seq_metro == nil then
+    self.seq_metro = metro.init(function()
+      self:tick_sequence()
+    end, self:metro_interval(), -1)
+  end
+  return self.seq_metro
+end
+
 function GridSequencer:start_sequence()
   self:stop_sequence()
   self.playing = true
   self.play_page = self:first_loop_page()
   self.play_step = 1
   self:apply_current_region()
-  self.seq_clock = clock.run(function()
-    while self.playing do
-      clock.sync(1 / (4 * self:current_rate()))
-      self:advance_step()
-    end
-  end)
+  self.next_step_time = util.time() + self:step_seconds()
+  local seq_metro = self:ensure_sequence_metro()
+  if seq_metro ~= nil then
+    seq_metro:start(self:metro_interval(), -1)
+  end
   self:request_redraw()
 end
 
 function GridSequencer:stop_sequence()
   self.playing = false
-  if self.seq_clock ~= nil then
-    clock.cancel(self.seq_clock)
-    self.seq_clock = nil
+  if self.seq_metro ~= nil then
+    self.seq_metro:stop()
   end
+  self.next_step_time = nil
   self.play_step = 1
   self.play_page = self:first_loop_page()
   self:reset_region()
@@ -254,6 +281,37 @@ function GridSequencer:set_transport(playing)
     self:start_sequence()
   else
     self:stop_sequence()
+  end
+end
+
+function GridSequencer:tick_sequence()
+  if not self.playing then
+    if self.seq_metro ~= nil then
+      self.seq_metro:stop()
+    end
+    return
+  end
+
+  local now = util.time()
+  if self.next_step_time == nil then
+    self.next_step_time = now + self:step_seconds()
+  end
+
+  local advanced = false
+  local guard = 0
+  while self.playing and now >= self.next_step_time and guard < 8 do
+    self:advance_step()
+    self.next_step_time = self.next_step_time + self:step_seconds()
+    advanced = true
+    guard = guard + 1
+  end
+
+  if advanced and self.next_step_time < now then
+    self.next_step_time = now + self:step_seconds()
+  end
+
+  if self.seq_metro ~= nil then
+    self.seq_metro.time = self:metro_interval()
   end
 end
 

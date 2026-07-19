@@ -401,6 +401,9 @@ function init()
     base_region = function()
       return params:get(id("loop_start")), params:get(id("loop_end"))
     end,
+    get_tempo = function()
+      return params:get(id("target_bpm"))
+    end,
     phase = display_phase,
     show_message = show_message,
     request_redraw = request_redraw
