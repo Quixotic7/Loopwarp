@@ -9,6 +9,7 @@ local alt = false
 local browsing = false
 local browser_state_file = nil
 local last_sample_folder = nil
+local redraw_metro = nil
 local previous_osc_event = osc.event
 local quiet_osc_paths = {
   ["/loopwarp/status"] = true,
@@ -16,6 +17,7 @@ local quiet_osc_paths = {
 }
 local status = {
   phase = 0,
+  phase_time = 0,
   frames = 0,
   amp_l = 0,
   amp_r = 0,
@@ -227,10 +229,36 @@ local function draw_two_pairs(left_label, left_value, right_label, right_value, 
   screen.text_right(right_value)
 end
 
+local function loop_phase_rate()
+  local start_point = params:get(id("loop_start")) or 0
+  local end_point = params:get(id("loop_end")) or 128
+  local region = math.max(0.01, end_point - start_point) / 128
+  local steps = math.max(1, params:get(id("sample_steps")) or 16)
+  local loop_beats = math.max(0.03125, (steps / 4) * region)
+
+  if params:get(id("mode")) == 1 then
+    local bpm = status.derived_bpm > 0 and status.derived_bpm or params:get(id("sample_bpm"))
+    local pitch_ratio = math.pow(2, (params:get(id("pitch")) or 0) / 12)
+    return (bpm / 60 / loop_beats) * pitch_ratio
+  end
+
+  return (params:get(id("target_bpm")) or 120) / 60 / loop_beats
+end
+
+local function display_phase()
+  local phase = status.phase or 0
+  if not playing then
+    return phase
+  end
+
+  local elapsed = util.time() - (status.phase_time or util.time())
+  return (phase + (elapsed * loop_phase_rate())) % 1
+end
+
 local function draw_playhead(y)
   local x0 = 4
   local x1 = 124
-  local phase = util.clamp(status.phase or 0, 0, 1)
+  local phase = util.clamp(display_phase(), 0, 1)
   local x = x0 + ((x1 - x0) * phase)
 
   screen.level(4)
@@ -246,6 +274,7 @@ end
 
 local function set_playing(state)
   playing = state
+  status.phase_time = util.time()
   params:set(id("play"), playing and 1 or 0, true)
   print("loopwarp: K3/play state " .. tostring(playing and 1 or 0))
   loopwarp.play(playing)
@@ -275,6 +304,22 @@ local function select_sample()
   end
 end
 
+local function start_redraw_metro()
+  if redraw_metro ~= nil then
+    redraw_metro:stop()
+  end
+
+  redraw_metro = metro.init(function()
+    if not browsing and norns.menu.status() == false then
+      redraw()
+    end
+  end, 1 / 15, -1)
+
+  if redraw_metro ~= nil then
+    redraw_metro:start()
+  end
+end
+
 function init()
   loopwarp.params({
     prefix = PREFIX,
@@ -291,6 +336,7 @@ function init()
       end
       if path == "/loopwarp/status" then
         status.phase = tonumber(args[5]) or status.phase
+        status.phase_time = util.time()
         status.frames = tonumber(args[6]) or status.frames
         status.amp_l = tonumber(args[7]) or status.amp_l
         status.amp_r = tonumber(args[8]) or status.amp_r
@@ -300,8 +346,10 @@ function init()
         end
       elseif path == "/loopwarp/transport" then
         status.phase = tonumber(args[1]) or status.phase
+        status.phase_time = util.time()
       elseif path == "/loopwarp/requestedStatus" then
         status.phase = tonumber(args[4]) or status.phase
+        status.phase_time = util.time()
         status.frames = tonumber(args[5]) or status.frames
         status.derived_bpm = tonumber(args[8]) or status.derived_bpm
         if status.derived_bpm > 0 then
@@ -311,7 +359,7 @@ function init()
         status.frames = tonumber(args[3]) or status.frames
         status.derived_bpm = tonumber(args[5]) or status.derived_bpm
       end
-      if not browsing then
+      if not browsing and not quiet_osc_paths[path] then
         redraw()
       end
     elseif previous_osc_event ~= nil then
@@ -320,6 +368,7 @@ function init()
   end
 
   set_playing(false)
+  start_redraw_metro()
   redraw()
 end
 
@@ -407,6 +456,10 @@ function redraw()
 end
 
 function cleanup()
+  if redraw_metro ~= nil then
+    redraw_metro:stop()
+    redraw_metro = nil
+  end
   loopwarp.stop_clock_sync()
   osc.event = previous_osc_event
   print("loopwarp: cleanup play 0")

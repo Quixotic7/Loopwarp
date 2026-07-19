@@ -155,7 +155,7 @@ Engine_LoopWarp : CroneEngine {
 				resetPos.clip(0, 0.999999)
 			);
 			Out.ar(out, phase);
-			SendReply.kr(Impulse.kr(20), cmdName: '/loopwarp/transportRaw', values: [
+			SendReply.kr(Impulse.kr(4), cmdName: '/loopwarp/transportRaw', values: [
 				phase,
 				correction,
 				targetBpm
@@ -204,7 +204,7 @@ Engine_LoopWarp : CroneEngine {
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * playGate);
 			sig = LeakDC.ar(sig);
-			SendReply.kr(Impulse.kr(15), cmdName: '/loopwarp/statusRaw', values: [
+			SendReply.kr(Impulse.kr(4), cmdName: '/loopwarp/statusRaw', values: [
 				2, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			]);
 			Out.ar(out, sig);
@@ -240,7 +240,7 @@ Engine_LoopWarp : CroneEngine {
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * gainNorm * playGate);
 			sig = LeakDC.ar(sig);
-			SendReply.kr(Impulse.kr(15), cmdName: '/loopwarp/statusRaw', values: [
+			SendReply.kr(Impulse.kr(4), cmdName: '/loopwarp/statusRaw', values: [
 				3, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			]);
 			Out.ar(out, sig);
@@ -278,7 +278,7 @@ Engine_LoopWarp : CroneEngine {
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * gainNorm * playGate);
 			sig = LeakDC.ar(sig);
-			SendReply.kr(Impulse.kr(15), cmdName: '/loopwarp/statusRaw', values: [
+			SendReply.kr(Impulse.kr(4), cmdName: '/loopwarp/statusRaw', values: [
 				4, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			]);
 			Out.ar(out, sig);
@@ -308,7 +308,7 @@ Engine_LoopWarp : CroneEngine {
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * playGate);
 			sig = LeakDC.ar(sig);
-			SendReply.kr(Impulse.kr(15), cmdName: '/loopwarp/statusRaw', values: [
+			SendReply.kr(Impulse.kr(4), cmdName: '/loopwarp/statusRaw', values: [
 				5, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			]);
 			Out.ar(out, sig);
@@ -348,7 +348,7 @@ Engine_LoopWarp : CroneEngine {
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * playGate);
 			sig = LeakDC.ar(sig);
-			SendReply.kr(Impulse.kr(15), cmdName: '/loopwarp/statusRaw', values: [
+			SendReply.kr(Impulse.kr(4), cmdName: '/loopwarp/statusRaw', values: [
 				modeId, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			]);
 			Out.ar(out, sig);
