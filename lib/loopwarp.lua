@@ -218,6 +218,15 @@ function loopwarp.request_status()
   engine_call("requestStatus")
 end
 
+function loopwarp.set_loop_region(start_point, end_point, reset_playhead)
+  flush_engine_sends()
+  engine_call("loopStart", start_point)
+  engine_call("loopEnd", end_point)
+  if reset_playhead then
+    engine_call("playhead", 0)
+  end
+end
+
 function loopwarp.params(options)
   options = options or {}
   local prefix = options.prefix or "loopwarp_"

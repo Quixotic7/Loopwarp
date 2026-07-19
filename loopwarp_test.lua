@@ -1,6 +1,7 @@
 engine.name = "LoopWarp"
 
 local loopwarp = include("lib/loopwarp")
+local GridSequencer = include("lib/grid_sequencer")
 local fileselect = require "fileselect"
 
 local PREFIX = "loopwarp_"
@@ -11,6 +12,9 @@ local browser_state_file = nil
 local last_sample_folder = nil
 local redraw_metro = nil
 local redraw_pending = true
+local grid_ui = nil
+local ui_message = nil
+local ui_message_clock = nil
 local previous_osc_event = osc.event
 local quiet_osc_paths = {
   ["/loopwarp/status"] = true,
@@ -234,9 +238,41 @@ local function request_redraw()
   redraw_pending = true
 end
 
-local function loop_phase_rate()
-  local start_point = params:get(id("loop_start")) or 0
-  local end_point = params:get(id("loop_end")) or 128
+local function show_message(text)
+  ui_message = text
+  if ui_message_clock ~= nil then
+    clock.cancel(ui_message_clock)
+  end
+  ui_message_clock = clock.run(function()
+    clock.sleep(1)
+    ui_message = nil
+    ui_message_clock = nil
+    request_redraw()
+  end)
+  request_redraw()
+end
+
+local function visible_message()
+  return ui_message
+end
+
+local function status_message()
+  if grid_ui ~= nil and grid_ui.screen_status ~= nil then
+    return grid_ui:screen_status() or visible_message()
+  end
+  return visible_message()
+end
+
+local function active_region()
+  if grid_ui ~= nil and grid_ui.active_region ~= nil then
+    return grid_ui:active_region()
+  end
+  return params:get(id("loop_start")) or 0, params:get(id("loop_end")) or 128
+end
+
+local function loop_phase_rate(start_point, end_point)
+  start_point = start_point or params:get(id("loop_start")) or 0
+  end_point = end_point or params:get(id("loop_end")) or 128
   local region = math.max(0.01, end_point - start_point) / 128
   local steps = math.max(1, params:get(id("sample_steps")) or 16)
   local loop_beats = math.max(0.03125, (steps / 4) * region)
@@ -257,19 +293,31 @@ local function display_phase()
   end
 
   local elapsed = util.time() - (status.phase_time or util.time())
-  return (phase + (elapsed * loop_phase_rate())) % 1
+  local start_point, end_point = active_region()
+  return (phase + (elapsed * loop_phase_rate(start_point, end_point))) % 1
 end
 
 local function draw_playhead(y)
   local x0 = 4
   local x1 = 124
+  local start_point, end_point = active_region()
   local phase = util.clamp(display_phase(), 0, 1)
-  local x = x0 + ((x1 - x0) * phase)
+  local position = util.clamp(start_point + ((end_point - start_point) * phase), 0, 128)
+  local x = x0 + ((x1 - x0) * (position / 128))
 
   screen.level(4)
   screen.move(x0, y)
   screen.line(x1, y)
   screen.stroke()
+
+  if start_point > 0 or end_point < 128 then
+    local rx0 = x0 + ((x1 - x0) * (util.clamp(start_point, 0, 128) / 128))
+    local rx1 = x0 + ((x1 - x0) * (util.clamp(end_point, 0, 128) / 128))
+    screen.level(8)
+    screen.move(rx0, y)
+    screen.line(rx1, y)
+    screen.stroke()
+  end
 
   screen.level(15)
   screen.move(x, y - 3)
@@ -283,6 +331,9 @@ local function set_playing(state)
   params:set(id("play"), playing and 1 or 0, true)
   print("loopwarp: K3/play state " .. tostring(playing and 1 or 0))
   loopwarp.play(playing)
+  if grid_ui ~= nil then
+    grid_ui:set_transport(playing)
+  end
   request_redraw()
 end
 
@@ -321,6 +372,9 @@ local function start_redraw_metro()
         redraw()
       end
     end
+    if grid_ui ~= nil then
+      grid_ui:redraw()
+    end
   end, 1 / 12, -1)
 
   if redraw_metro ~= nil then
@@ -335,6 +389,22 @@ function init()
     clock_sync = false
   })
   load_browser_folder()
+  grid_ui = GridSequencer.new({
+    set_playing = set_playing,
+    set_loop_region = function(start_point, end_point, reset_playhead)
+      loopwarp.set_loop_region(start_point, end_point, reset_playhead)
+      if reset_playhead then
+        status.phase = 0
+        status.phase_time = util.time()
+      end
+    end,
+    base_region = function()
+      return params:get(id("loop_start")), params:get(id("loop_end"))
+    end,
+    phase = display_phase,
+    show_message = show_message,
+    request_redraw = request_redraw
+  })
 
   loopwarp.log_engine_commands()
   osc.event = function(path, args, from)
@@ -441,7 +511,7 @@ function redraw()
 
   screen.level(15)
   screen.move(0, 21)
-  screen.text_trim(sample_name(), 128)
+  screen.text_trim(status_message() or sample_name(), 128)
 
   screen.level(4)
   screen.move(0, 33)
@@ -464,6 +534,14 @@ function redraw()
 end
 
 function cleanup()
+  if ui_message_clock ~= nil then
+    clock.cancel(ui_message_clock)
+    ui_message_clock = nil
+  end
+  if grid_ui ~= nil then
+    grid_ui:cleanup()
+    grid_ui = nil
+  end
   if redraw_metro ~= nil then
     redraw_metro:stop()
     redraw_metro = nil
