@@ -413,7 +413,11 @@ Engine_LoopWarp : CroneEngine {
 
 	spawnMode { arg modeIndex, startAmp;
 		var synth;
-		synth = Synth.new(modeSynthNames.wrapAt(modeIndex.asInteger), this.commonArgs(startAmp), context.xg);
+		if(transportSynth.notNil, {
+			synth = Synth.after(transportSynth, modeSynthNames.wrapAt(modeIndex.asInteger), this.commonArgs(startAmp));
+		}, {
+			synth = Synth.tail(context.xg, modeSynthNames.wrapAt(modeIndex.asInteger), this.commonArgs(startAmp));
+		});
 		^synth;
 	}
 
