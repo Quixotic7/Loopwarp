@@ -155,7 +155,7 @@ Engine_LoopWarp : CroneEngine {
 				resetPos.clip(0, 0.999999)
 			);
 			Out.ar(out, phase);
-			SendReply.kr(Impulse.kr(4), cmdName: '/loopwarp/transportRaw', values: [
+			SendReply.kr(Impulse.kr(1), cmdName: '/loopwarp/transportRaw', values: [
 				phase,
 				correction,
 				targetBpm
@@ -204,7 +204,7 @@ Engine_LoopWarp : CroneEngine {
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * playGate);
 			sig = LeakDC.ar(sig);
-			SendReply.kr(Impulse.kr(4), cmdName: '/loopwarp/statusRaw', values: [
+			SendReply.kr(Impulse.kr(1), cmdName: '/loopwarp/statusRaw', values: [
 				2, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			]);
 			Out.ar(out, sig);
@@ -215,17 +215,18 @@ Engine_LoopWarp : CroneEngine {
 			playing=0, resetTrig=0, resetPos=0,
 			amp=0.8, pan=0, pitch=0, targetBpm=120, loopBeats=4, macro=0,
 			startPoint=0, endPoint=128, grainSize=0.08, grainOverlap=8, grainJitter=0.0, grainSpray=0.0;
-			var phase, frames, pos, dur, randomness, direct, wet, sig, modeGain, playGate, gainNorm, startNorm, range, readPhase, stepDur, overlap;
+			var phase, frames, pos, dur, randomness, direct, wet, sig, modeGain, playGate, gainNorm, startNorm, range, readPhase, stepDur, overlap, overlapControl;
 			phase = In.ar(phaseBus, 1);
 			frames = BufFrames.kr(bufL).max(4);
 			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.02);
 			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.02);
 			readPhase = (startNorm + (phase * range)).clip(0, 0.999999);
 			pos = readPhase * (frames - 1);
-			dur = grainSize.clip(0.02, 0.5);
+			dur = Lag.kr(grainSize.clip(0.02, 0.5), 0.05);
 			stepDur = 15 / targetBpm.max(1);
-			overlap = ((grainOverlap.clip(1, 64) * dur) / stepDur).clip(2, 32);
-			randomness = (grainJitter + grainSpray + (macro * 0.03)).clip(0, 0.25);
+			overlapControl = Lag.kr(grainOverlap.clip(1, 64), 0.05);
+			overlap = ((overlapControl * dur) / stepDur).clip(2, 32);
+			randomness = Lag.kr((grainJitter + grainSpray + (macro * 0.03)).clip(0, 0.25), 0.05);
 			direct = [
 				BufRd.ar(1, bufL, pos, loop: 1, interpolation: 4),
 				BufRd.ar(1, bufR, pos, loop: 1, interpolation: 4)
@@ -240,7 +241,7 @@ Engine_LoopWarp : CroneEngine {
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * gainNorm * playGate);
 			sig = LeakDC.ar(sig);
-			SendReply.kr(Impulse.kr(4), cmdName: '/loopwarp/statusRaw', values: [
+			SendReply.kr(Impulse.kr(1), cmdName: '/loopwarp/statusRaw', values: [
 				3, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			]);
 			Out.ar(out, sig);
@@ -251,18 +252,20 @@ Engine_LoopWarp : CroneEngine {
 			playing=0, resetTrig=0, resetPos=0,
 			amp=0.8, pan=0, pitch=0, targetBpm=120, loopBeats=4, macro=0,
 			startPoint=0, endPoint=128, grainSize=0.1, grainOverlap=6, wander=0.03, timingJitter=0.0;
-			var phase, frames, trig, dur, rate, chaos, pos, offset, direct, wet, sig, modeGain, playGate, gainNorm, startNorm, range, readPhase, stepDur;
+			var phase, frames, trig, dur, rate, chaos, pos, offset, direct, wet, sig, modeGain, playGate, gainNorm, startNorm, range, readPhase, stepDur, overlapControl, wanderControl;
 			phase = In.ar(phaseBus, 1);
 			frames = BufFrames.kr(bufL).max(4);
 			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.02);
 			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.02);
 			readPhase = (startNorm + (phase * range)).clip(0, 0.999999);
-			dur = grainSize.clip(0.03, 0.6);
+			dur = Lag.kr(grainSize.clip(0.03, 0.6), 0.05);
 			stepDur = 15 / targetBpm.max(1);
-			rate = (grainOverlap.clip(1, 64) / stepDur).clip(1, 240);
+			overlapControl = Lag.kr(grainOverlap.clip(1, 64), 0.05);
+			rate = (overlapControl / stepDur).clip(1, 240);
 			trig = Impulse.ar(rate);
 			chaos = macro.clip(0, 1);
-			offset = TRand.ar(wander.neg, wander, trig) * (0.25 + chaos);
+			wanderControl = Lag.kr(wander.clip(0, 0.25), 0.05);
+			offset = TRand.ar(wanderControl.neg, wanderControl, trig) * (0.25 + chaos);
 			pos = ((readPhase * BufDur.kr(bufL)) + offset + (TRand.ar(timingJitter.neg, timingJitter, trig) * chaos)).wrap(0, BufDur.kr(bufL).max(0.001));
 			direct = [
 				BufRd.ar(1, bufL, readPhase * (frames - 1), loop: 1, interpolation: 4),
@@ -273,12 +276,12 @@ Engine_LoopWarp : CroneEngine {
 				TGrains.ar(1, trig, bufR, Lag.kr(pitch, 0.03).midiratio, pos, dur, 0, 1, 4)
 			];
 			sig = XFade2.ar(direct, wet, macro.linlin(0, 1, -0.75, 0.25));
-			gainNorm = grainOverlap.clip(1, 64).sqrt.reciprocal * 2.5;
+			gainNorm = overlapControl.sqrt.reciprocal * 2.5;
 			playGate = Lag.kr(playing.clip(0, 1), 0.01);
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * gainNorm * playGate);
 			sig = LeakDC.ar(sig);
-			SendReply.kr(Impulse.kr(4), cmdName: '/loopwarp/statusRaw', values: [
+			SendReply.kr(Impulse.kr(1), cmdName: '/loopwarp/statusRaw', values: [
 				4, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			]);
 			Out.ar(out, sig);
@@ -301,14 +304,14 @@ Engine_LoopWarp : CroneEngine {
 				BufRd.ar(1, bufR, pos, loop: 1, interpolation: 4)
 			];
 			ratio = (derivedSourceBpm.max(1) / targetBpm.max(1) * Lag.kr(pitch, 0.03).midiratio).clip(0.5, 2);
-			window = pvWindow.clip(0.005, 2) * (1 + macro.clip(0, 1));
-			shifted = PitchShift.ar(raw, window, ratio, pvDispersion.clip(0, 1), pvTimeDispersion.clip(0, 1));
+			window = Lag.kr(pvWindow.clip(0.005, 2), 0.05) * (1 + macro.clip(0, 1));
+			shifted = PitchShift.ar(raw, window, ratio, Lag.kr(pvDispersion.clip(0, 1), 0.05), Lag.kr(pvTimeDispersion.clip(0, 1), 0.05));
 			sig = shifted;
 			playGate = Lag.kr(playing.clip(0, 1), 0.01);
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * playGate);
 			sig = LeakDC.ar(sig);
-			SendReply.kr(Impulse.kr(4), cmdName: '/loopwarp/statusRaw', values: [
+			SendReply.kr(Impulse.kr(1), cmdName: '/loopwarp/statusRaw', values: [
 				5, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			]);
 			Out.ar(out, sig);
@@ -348,7 +351,7 @@ Engine_LoopWarp : CroneEngine {
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * playGate);
 			sig = LeakDC.ar(sig);
-			SendReply.kr(Impulse.kr(4), cmdName: '/loopwarp/statusRaw', values: [
+			SendReply.kr(Impulse.kr(1), cmdName: '/loopwarp/statusRaw', values: [
 				modeId, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			]);
 			Out.ar(out, sig);

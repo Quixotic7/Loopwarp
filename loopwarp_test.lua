@@ -10,6 +10,7 @@ local browsing = false
 local browser_state_file = nil
 local last_sample_folder = nil
 local redraw_metro = nil
+local redraw_pending = true
 local previous_osc_event = osc.event
 local quiet_osc_paths = {
   ["/loopwarp/status"] = true,
@@ -229,6 +230,10 @@ local function draw_two_pairs(left_label, left_value, right_label, right_value, 
   screen.text_right(right_value)
 end
 
+local function request_redraw()
+  redraw_pending = true
+end
+
 local function loop_phase_rate()
   local start_point = params:get(id("loop_start")) or 0
   local end_point = params:get(id("loop_end")) or 128
@@ -278,7 +283,7 @@ local function set_playing(state)
   params:set(id("play"), playing and 1 or 0, true)
   print("loopwarp: K3/play state " .. tostring(playing and 1 or 0))
   loopwarp.play(playing)
-  redraw()
+  request_redraw()
 end
 
 local function load_file(path)
@@ -289,7 +294,7 @@ local function load_file(path)
     set_playing(false)
     params:set(id("sample"), path)
   end
-  redraw()
+  request_redraw()
 end
 
 local function select_sample()
@@ -311,9 +316,12 @@ local function start_redraw_metro()
 
   redraw_metro = metro.init(function()
     if not browsing and norns.menu.status() == false then
-      redraw()
+      if playing or redraw_pending then
+        redraw_pending = false
+        redraw()
+      end
     end
-  end, 1 / 15, -1)
+  end, 1 / 12, -1)
 
   if redraw_metro ~= nil then
     redraw_metro:start()
@@ -360,7 +368,7 @@ function init()
         status.derived_bpm = tonumber(args[5]) or status.derived_bpm
       end
       if not browsing and not quiet_osc_paths[path] then
-        redraw()
+        request_redraw()
       end
     elseif previous_osc_event ~= nil then
       previous_osc_event(path, args, from)
@@ -375,7 +383,7 @@ end
 function key(n, z)
   if n == 1 then
     alt = z == 1
-    redraw()
+    request_redraw()
     return
   end
 
@@ -393,7 +401,7 @@ function key(n, z)
     set_playing(not playing)
   end
 
-  redraw()
+  request_redraw()
 end
 
 function enc(n, d)
@@ -411,7 +419,7 @@ function enc(n, d)
     params:delta(id(current_controls()[2].id), d)
   end
 
-  redraw()
+  request_redraw()
 end
 
 function redraw()
@@ -460,6 +468,7 @@ function cleanup()
     redraw_metro:stop()
     redraw_metro = nil
   end
+  loopwarp.stop_param_throttle()
   loopwarp.stop_clock_sync()
   osc.event = previous_osc_event
   print("loopwarp: cleanup play 0")

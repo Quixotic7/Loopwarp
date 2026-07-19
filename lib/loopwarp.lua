@@ -10,6 +10,7 @@
 --   end
 
 local cs = require "controlspec"
+local unpack = table.unpack or unpack
 
 local loopwarp = {}
 
@@ -23,6 +24,10 @@ loopwarp.modes = {
 }
 
 local sync_thread = nil
+local engine_send_metro = nil
+local engine_send_interval = 1 / 12
+local pending_engine_sends = {}
+local pending_engine_order = {}
 local clock_origin = 0
 local clock_sequence = 0
 local ids = {}
@@ -86,6 +91,51 @@ local function engine_call(name, ...)
   end
 end
 
+local flush_engine_sends
+
+local function ensure_engine_send_metro()
+  if engine_send_metro == nil then
+    engine_send_metro = metro.init(function()
+      flush_engine_sends()
+    end, engine_send_interval, -1)
+  end
+  if engine_send_metro ~= nil and not engine_send_metro.is_running then
+    engine_send_metro:start()
+  end
+end
+
+local function queue_engine_send(key, action)
+  if pending_engine_sends[key] == nil then
+    table.insert(pending_engine_order, key)
+  end
+  pending_engine_sends[key] = action
+  ensure_engine_send_metro()
+end
+
+local function queue_engine_call(key, name, ...)
+  local args = {...}
+  queue_engine_send(key, function()
+    engine_call(name, unpack(args))
+  end)
+end
+
+flush_engine_sends = function()
+  local sends = pending_engine_sends
+  local order = pending_engine_order
+  pending_engine_sends = {}
+  pending_engine_order = {}
+
+  for _, key in ipairs(order) do
+    if sends[key] ~= nil then
+      sends[key]()
+    end
+  end
+
+  if next(pending_engine_sends) == nil and engine_send_metro ~= nil then
+    engine_send_metro:stop()
+  end
+end
+
 local function reset_clock_origin()
   clock_origin = clock.get_beats()
   clock_sequence = 0
@@ -127,6 +177,15 @@ function loopwarp.stop_clock_sync()
   if sync_thread ~= nil then
     clock.cancel(sync_thread)
     sync_thread = nil
+  end
+end
+
+function loopwarp.stop_param_throttle()
+  pending_engine_sends = {}
+  pending_engine_order = {}
+  if engine_send_metro ~= nil then
+    engine_send_metro:stop()
+    engine_send_metro = nil
   end
 end
 
@@ -226,6 +285,7 @@ function loopwarp.params(options)
           print("loopwarp: sample bpm=" .. tostring(bpm) .. " inferred sample steps=" .. tostring(inferred_steps))
           params:set(ids.sample_steps, inferred_steps)
         end
+        flush_engine_sends()
         load_sample(path)
       else
         print("loopwarp: sample missing, not loading: " .. path)
@@ -236,13 +296,14 @@ function loopwarp.params(options)
 
   params:add_option(ids.mode, "mode", loopwarp.modes, 1)
   params:set_action(ids.mode, function(x)
+    flush_engine_sends()
     engine_call("setMode", x - 1)
     apply_current_mode_params()
   end)
 
   add_control(ids.mode_macro, "mode macro",
     cs.new(0, 1, "lin", 0.001, 0, "", 0.001),
-    function(x) engine_call("setModeMacro", x) end)
+    function(x) queue_engine_call(ids.mode_macro, "setModeMacro", x) end)
 
   params:add_binary(ids.play, "play", "toggle", 0)
   params:set_action(ids.play, set_engine_play)
@@ -259,11 +320,11 @@ function loopwarp.params(options)
 
   add_control(param_id(prefix, "amp"), "amp",
     cs.new(0, 2, "lin", 0.01, 0.8, "", 0.005),
-    function(x) engine_call("setAmp", x) end)
+    function(x) queue_engine_call(param_id(prefix, "amp"), "setAmp", x) end)
 
   add_control(param_id(prefix, "pan"), "pan",
     cs.new(-1, 1, "lin", 0.01, 0, "", 0.005),
-    function(x) engine_call("setPan", x) end)
+    function(x) queue_engine_call(param_id(prefix, "pan"), "setPan", x) end)
 
   add_control(param_id(prefix, "source_bpm"), "derived source bpm",
     cs.new(20, 300, "lin", 0.1, 120, "bpm", 1 / 280),
@@ -272,103 +333,105 @@ function loopwarp.params(options)
   add_control(ids.target_bpm, "target bpm",
     cs.new(20, 300, "lin", 1, 120, "bpm", 1 / 280),
     function(x)
-      if clock.set_tempo ~= nil then
-        clock.set_tempo(x)
-      end
-      engine_call("targetBpm", x)
+      queue_engine_send(ids.target_bpm, function()
+        if clock.set_tempo ~= nil then
+          clock.set_tempo(x)
+        end
+        engine_call("targetBpm", x)
+      end)
     end)
 
   add_control(ids.sample_bpm, "sample bpm",
     cs.new(20, 300, "lin", 1, 120, "bpm", 1 / 280),
-    function(x) engine_call("sourceBpm", x) end)
+    function(x) queue_engine_call(ids.sample_bpm, "sourceBpm", x) end)
 
   add_control(ids.sample_steps, "sample steps",
     cs.new(1, 512, "lin", 1, 16, "", 1 / 511),
-    function(x) engine_call("setSampleSteps", x) end,
+    function(x) queue_engine_call(ids.sample_steps, "setSampleSteps", x) end,
     function(param) return tostring(math.floor(param:get() + 0.5)) end)
 
   add_control(param_id(prefix, "playhead"), "playhead",
     cs.new(0, 1, "lin", 0.001, 0, "", 0.001),
-    function(x) engine_call("setPlayhead", x) end)
+    function(x) queue_engine_call(param_id(prefix, "playhead"), "setPlayhead", x) end)
   if params.hide ~= nil then
     params:hide(param_id(prefix, "playhead"))
   end
 
   add_control(ids.loop_start, "sample start",
     cs.new(0, 128, "lin", 0.01, 0, "", 1 / 128),
-    function(x) engine.loopStart(x) end)
+    function(x) queue_engine_call(ids.loop_start, "loopStart", x) end)
 
   add_control(ids.loop_end, "sample end",
     cs.new(0, 128, "lin", 0.01, 128, "", 1 / 128),
-    function(x) engine.loopEnd(x) end)
+    function(x) queue_engine_call(ids.loop_end, "loopEnd", x) end)
 
   add_control(param_id(prefix, "xfade"), "loop xfade",
     cs.new(0, 0.25, "lin", 0.001, 0.005, "", 0.004),
-    function(x) engine.xfade(x) end,
+    function(x) queue_engine_call(param_id(prefix, "xfade"), "xfade", x) end,
     format_ms)
 
   add_control(param_id(prefix, "pitch"), "pitch",
     cs.new(-24, 24, "lin", 0.1, 0, "st", 0.1 / 48),
-    function(x) engine_call("setPitch", x) end)
+    function(x) queue_engine_call(param_id(prefix, "pitch"), "setPitch", x) end)
 
   add_control(ids.mode_switch_fade, "mode switch fade",
     cs.new(0.001, 0.25, "lin", 0.001, 0.05, "", 0.001 / 0.249),
-    function(x) engine_call("setModeSwitchFade", x) end)
+    function(x) queue_engine_call(ids.mode_switch_fade, "setModeSwitchFade", x) end)
 
   add_control(param_id(prefix, "chop_steps"), "chop steps",
     cs.new(0.25, 16, "lin", 0.25, 1, "steps", 0.25 / 15.75),
-    function(x) engine_call("chopSteps", x) end)
+    function(x) queue_engine_call(param_id(prefix, "chop_steps"), "chopSteps", x) end)
 
   params:add_option(param_id(prefix, "chop_loop_mode"), "chop loop mode", {"forward stop", "loop forward", "ping pong"}, 1)
   params:set_action(param_id(prefix, "chop_loop_mode"), function(x) engine_call("chopLoopMode", x - 1) end)
 
   add_control(param_id(prefix, "chop_attack"), "chop attack",
     cs.new(0.0001, 0.2, "lin", 0.0001, 0.002, "s", 0.0005 / 0.1999),
-    function(x) engine.chopAttack(x) end,
+    function(x) queue_engine_call(param_id(prefix, "chop_attack"), "chopAttack", x) end,
     format_ms)
 
   add_control(param_id(prefix, "chop_hold"), "chop hold",
     cs.new(0, 0.5, "lin", 0.001, 0.04, "s", 0.001 / 0.5),
-    function(x) engine.chopHold(x) end,
+    function(x) queue_engine_call(param_id(prefix, "chop_hold"), "chopHold", x) end,
     format_ms)
 
   add_control(param_id(prefix, "chop_release"), "chop release",
     cs.new(0.0001, 0.2, "lin", 0.0001, 0.01, "s", 0.0005 / 0.1999),
-    function(x) engine.chopRelease(x) end,
+    function(x) queue_engine_call(param_id(prefix, "chop_release"), "chopRelease", x) end,
     format_ms)
 
   add_control(param_id(prefix, "grain_size"), "grain size",
     cs.new(0.002, 0.5, "lin", 0.001, 0.08, "s", 0.001 / 0.498),
-    function(x) engine.grainSize(x) end,
+    function(x) queue_engine_call(param_id(prefix, "grain_size"), "grainSize", x) end,
     format_ms)
 
   add_control(param_id(prefix, "grain_density"), "grain density",
     cs.new(1, 64, "lin", 1, 8, "gr/step", 1 / 63),
-    function(x) engine.grainDensity(x) end)
+    function(x) queue_engine_call(param_id(prefix, "grain_density"), "grainDensity", x) end)
 
   add_control(param_id(prefix, "grain_jitter"), "grain jitter",
     cs.new(0, 0.25, "lin", 0.001, 0.01, "s", 0.001 / 0.25),
-    function(x) engine.grainJitter(x) end,
+    function(x) queue_engine_call(param_id(prefix, "grain_jitter"), "grainJitter", x) end,
     format_ms)
 
   add_control(param_id(prefix, "wsola_window"), "OLA window",
     cs.new(0.005, 0.5, "lin", 0.001, 0.08, "s", 0.001 / 0.495),
-    function(x) engine.wsolaWindow(x) end,
+    function(x) queue_engine_call(param_id(prefix, "wsola_window"), "wsolaWindow", x) end,
     format_ms)
 
   add_control(param_id(prefix, "wsola_search"), "OLA wander",
     cs.new(0, 0.1, "lin", 0.001, 0.015, "s", 0.001 / 0.1),
-    function(x) engine.wsolaSearch(x) end,
+    function(x) queue_engine_call(param_id(prefix, "wsola_search"), "wsolaSearch", x) end,
     format_ms)
 
   add_control(param_id(prefix, "pv_window"), "PC window",
     cs.new(0.005, 2, "lin", 0.001, 0.2, "", 0.001 / 1.995),
-    function(x) engine.pvWindow(x) end,
+    function(x) queue_engine_call(param_id(prefix, "pv_window"), "pvWindow", x) end,
     format_ms)
 
   add_control(param_id(prefix, "pv_dispersion"), "PC dispersion",
     cs.new(0, 1, "lin", 0.001, 0, "", 0.001),
-    function(x) engine.pvDispersion(x) end)
+    function(x) queue_engine_call(param_id(prefix, "pv_dispersion"), "pvDispersion", x) end)
 
   params:add_trigger(param_id(prefix, "reset"), "reset")
   params:set_action(param_id(prefix, "reset"), function() engine_call("reset") end)
