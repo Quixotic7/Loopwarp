@@ -7,6 +7,8 @@ local PREFIX = "loopwarp_"
 local playing = false
 local alt = false
 local browsing = false
+local browser_state_file = nil
+local last_sample_folder = nil
 local previous_osc_event = osc.event
 local quiet_osc_paths = {
   ["/loopwarp/status"] = true,
@@ -71,6 +73,61 @@ local function sample_name()
   return params:string(id("sample"))
 end
 
+local function parent_folder(path)
+  if path == nil or path == "" or path == "-" or path:sub(-1) == "/" then
+    return nil
+  end
+  return path:match("^(.*[/\\])[^/\\]+$")
+end
+
+local function normalize_folder(path)
+  if path == nil or path == "" then
+    return nil
+  end
+  if path:sub(-1) ~= "/" then
+    return path .. "/"
+  end
+  return path
+end
+
+local function state_file()
+  browser_state_file = browser_state_file or (_path.data .. "loopwarp_test/browser_state.data")
+  return browser_state_file
+end
+
+local function save_browser_folder(folder)
+  folder = normalize_folder(folder)
+  if folder == nil then
+    return
+  end
+
+  last_sample_folder = folder
+  util.make_dir(_path.data .. "loopwarp_test/")
+  tab.save({sample_folder = folder}, state_file())
+  print("loopwarp: sample browser folder " .. folder)
+end
+
+local function load_browser_folder()
+  local sample_folder = normalize_folder(parent_folder(params:get(id("sample"))))
+  if sample_folder ~= nil then
+    last_sample_folder = sample_folder
+    return
+  end
+
+  local data = tab.load(state_file())
+  if type(data) == "table" then
+    last_sample_folder = normalize_folder(data.sample_folder)
+  end
+end
+
+local function browser_folder()
+  return normalize_folder(parent_folder(params:get(id("sample")))) or last_sample_folder or _path.audio
+end
+
+local function folder_starts_with(folder, root)
+  return folder ~= nil and root ~= nil and folder:sub(1, #root) == root
+end
+
 local function current_controls()
   return mode_controls[params:get(id("mode"))] or mode_controls[1]
 end
@@ -87,6 +144,8 @@ local function short_mode()
   local mode = option_value("mode")
   if mode == "tempo_varispeed" then
     return "tempo"
+  elseif mode == "granular" then
+    return "grain"
   elseif mode == "pitch_corrected" then
     return "pc"
   elseif mode == "random_ola" then
@@ -197,6 +256,7 @@ local function load_file(path)
   print("loopwarp: file browser returned " .. tostring(path))
   browsing = false
   if path ~= "cancel" then
+    save_browser_folder(parent_folder(path))
     set_playing(false)
     params:set(id("sample"), path)
   end
@@ -204,9 +264,15 @@ local function load_file(path)
 end
 
 local function select_sample()
+  local folder = browser_folder()
   set_playing(false)
   browsing = true
-  fileselect.enter(_path.audio, load_file, "audio")
+  if folder_starts_with(folder, _path.dust) then
+    fileselect.enter(_path.dust, load_file, "audio")
+    fileselect.pushd(folder)
+  else
+    fileselect.enter(_path.audio, load_file, "audio")
+  end
 end
 
 function init()
@@ -215,6 +281,7 @@ function init()
     name = "loopwarp test",
     clock_sync = false
   })
+  load_browser_folder()
 
   loopwarp.log_engine_commands()
   osc.event = function(path, args, from)

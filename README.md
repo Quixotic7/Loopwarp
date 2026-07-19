@@ -1,6 +1,10 @@
-# LoopWarp Test
+# LoopWarp
 
-LoopWarp v2 foundation test script for norns.
+Loopwarp is a Timestretching playground for the Monome Norns
+
+Load in a sample and then experiment with different timestretch algorithms. Try changing the tempo and the pitch. 
+
+Each algorithm has different parameters associated with it that can make some pretty interesting effects. 
 
 Load with:
 
@@ -42,10 +46,28 @@ Loading a sample can auto-populate `sample bpm` from filenames such as `break_bp
 Current modes:
 
 - `tape`
+  
+Plays through the selected sample region at the sample’s native rate, like a tape deck. Internal BPM should not affect it. Pitch changes are varispeed: higher pitch means faster playback, lower pitch means slower playback. This mode is closest to BufRd over a moving sample position.
+
 - `tempo_varispeed`
+  
+Forces the selected sample region to fit the current step length and internal BPM. The playhead is tempo-driven, so the sample reaches the region end exactly when the loop cycle ends. Pitch is intentionally neutral here because playback speed is determined by time fitting.
+
 - `chopped`
+
+Divides the loop into rhythmic slices using chop steps. At 1 step, a bar is split into 16 slices; 2 steps gives 8 slices; 0.5 gives 32 slices. It gates playback with an envelope and can read each active slice in different ways:
+forward stop: play the slice, then stop under the envelope
+loop forward: keep moving forward through the sample
+ping pong: bounce back and forth inside the slice
+
 - `granular`
+  
+Reads the sample with small overlapping grains. The playhead still follows the selected region and clock, but the audio is reconstructed from short windows. grain size controls grain duration, grain density controls grains per step, grain jitter adds positional smear. Pitch can shift grains without simply changing loop duration.
+
 - `random_ola`
+
+A randomized overlap-add style mode. It is similar in spirit to granular, but instead of a smooth grain cloud it places overlapping chunks around the moving playhead with some wander/randomness. This gives a looser, shuffled stretch texture. Pitch changes grain playback rate.
+
 - `pitch_corrected`
 
-This milestone implements the shared transport, active-mode lifecycle, phase-aware switching, clock observations, step-based sample timing, selected sample regions, and status instrumentation. It does not yet implement guarded loop-region buffers, deterministic `ola`, true WSOLA, or true phase-vocoder modes.
+Reads the selected region on the tempo-synced playhead, then runs a pitch-shift process over that audio. The goal is “fit the timing, then correct/shift pitch,” but SuperCollider’s PitchShift has a distinct robotic/formant texture, especially when pitch or window size changes. PC window changes the pitch-shift analysis window; PC dispersion adds time/pitch smear.
