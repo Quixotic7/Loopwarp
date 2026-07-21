@@ -1,6 +1,6 @@
-// LoopWarpModes responsibility boundary.
+// ElasticatModes responsibility boundary.
 //
-// Mode SynthDefs are registered from Engine_LoopWarp.sc so the engine remains
+// Mode SynthDefs are registered from Engine_Elasticat.sc so the engine remains
 // self-contained for norns. The current first-class mode IDs are:
 //
 // 0 tape

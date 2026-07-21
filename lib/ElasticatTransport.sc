@@ -1,7 +1,7 @@
-// LoopWarpTransport responsibility boundary.
+// ElasticatTransport responsibility boundary.
 //
-// The shared transport SynthDef is implemented in Engine_LoopWarp.sc as
-// \loopWarpTransport for deploy safety.
+// The shared transport SynthDef is implemented in Engine_Elasticat.sc as
+// \elasticatTransport for deploy safety.
 //
 // Implemented transport behavior:
 // - audio-rate normalized phase bus

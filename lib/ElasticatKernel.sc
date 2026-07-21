@@ -1,6 +1,6 @@
-// LoopWarpKernel responsibility boundary.
+// ElasticatKernel responsibility boundary.
 //
-// The v2 runtime kernel currently lives in Engine_LoopWarp.sc so the norns
+// The v2 runtime kernel currently lives in Engine_Elasticat.sc so the norns
 // crone dynamic engine loader only needs to discover one Engine_* class file.
 //
 // Kernel responsibilities implemented there:

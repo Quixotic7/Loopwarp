@@ -1,0 +1,442 @@
+local ParamValues = {}
+ParamValues.__index = ParamValues
+
+local PATTERN_RATES = {0.125, 0.25, 0.5, 1, 2, 4, 8, 16}
+
+local function rate_label(rate)
+  if rate < 1 then
+    return string.format("%.3gx", rate)
+  end
+  return string.format("%gx", rate)
+end
+
+local function fmt_round(value)
+  return tostring(math.floor((value or 0) + 0.5))
+end
+
+local function fmt_1dp(value)
+  return string.format("%.1f", value or 0)
+end
+
+local function fmt_2dp(value)
+  return string.format("%.2f", value or 0)
+end
+
+local function fmt_3dp(value)
+  return string.format("%.3f", value or 0)
+end
+
+local function fmt_0dp(value)
+  return string.format("%.0f", value or 0)
+end
+
+local function fmt_percent(value)
+  return tostring(math.floor(((value or 0) * 100) + 0.5))
+end
+
+local function fmt_milli(value)
+  return tostring(math.floor(((value or 0) * 1000) + 0.5))
+end
+
+local function fmt_2dp_x(value)
+  return string.format("%.2fx", value or 0)
+end
+
+local function fmt_chop_steps(value)
+  local n = value or 0
+  if math.abs(n - math.floor(n + 0.5)) < 0.001 then
+    return tostring(math.floor(n + 0.5))
+  end
+  return string.format("%.2f", n)
+end
+
+-- Every simple numeric-display parameter maps its id to a formatter here.
+-- Adding a new one is a single line; only params with bespoke display logic
+-- (enum remapping, pseudo-items, etc.) need an explicit branch below instead.
+local ID_FORMATTERS = {
+  sample_slot = fmt_round,
+  target_bpm = fmt_round,
+  sample_bpm = fmt_round,
+  source_bpm = fmt_round,
+  sample_steps = fmt_round,
+  pattern_steps = fmt_round,
+  slice_count = fmt_round,
+  slice_index = fmt_round,
+  grain_density = fmt_round,
+  pitch = fmt_1dp,
+  default_length = fmt_2dp,
+  default_velocity = fmt_percent,
+  loop_start = fmt_0dp,
+  loop_end = fmt_0dp,
+  trim_start = fmt_3dp,
+  trim_end = fmt_3dp,
+  gain = fmt_2dp_x,
+  mode_macro = fmt_2dp,
+  amp = fmt_2dp,
+  pan = fmt_2dp,
+  slice_rate = fmt_2dp,
+  pv_dispersion = fmt_2dp,
+  chop_steps = fmt_chop_steps,
+  grain_size = fmt_milli,
+  grain_jitter = fmt_milli,
+  wsola_window = fmt_milli,
+  wsola_search = fmt_milli,
+  pv_window = fmt_milli,
+  xfade = fmt_milli,
+  slice_attack = fmt_milli,
+  slice_hold = fmt_milli,
+  slice_release = fmt_milli
+}
+
+function ParamValues.new(opts)
+  opts = opts or {}
+  return setmetatable({
+    id = opts.id,
+    show_message = opts.show_message,
+    sample_name = opts.sample_name,
+    param_value_or = opts.param_value_or,
+    get_grid_ui = opts.get_grid_ui,
+    get_alt = opts.get_alt,
+    get_select_sample = opts.get_select_sample,
+    get_default_trig_length = opts.get_default_trig_length,
+    set_default_trig_length = opts.set_default_trig_length,
+    get_default_trig_velocity = opts.get_default_trig_velocity,
+    set_default_trig_velocity = opts.set_default_trig_velocity,
+    set_last_trim_focus = opts.set_last_trim_focus,
+    active_step_lock_bases = opts.active_step_lock_bases or {},
+    active_step_lock_ids = opts.active_step_lock_ids or {},
+    value_flash_until = opts.value_flash_until or {},
+    value_flash_seconds = opts.value_flash_seconds or 0.85,
+    applying_step_locks = false
+  }, ParamValues)
+end
+
+function ParamValues:option_value(param_id)
+  local param = params:lookup_param(self.id(param_id))
+  if param == nil or param.options == nil then
+    return params:string(self.id(param_id))
+  end
+  return param.options[param:get()] or params:string(self.id(param_id))
+end
+
+function ParamValues:item_locked(param_item)
+  local grid_ui = self.get_grid_ui()
+  if grid_ui == nil or param_item == nil or param_item.lockable ~= true then
+    return false
+  end
+  return grid_ui:held_param_lock(param_item.lock_id or param_item.id) ~= nil
+end
+
+function ParamValues:item_param_id(param_item)
+  if param_item == nil or param_item.pseudo ~= nil then
+    return nil
+  end
+  return self.id(param_item.id)
+end
+
+function ParamValues:item_long_name(param_item)
+  if param_item == nil then
+    return ""
+  elseif param_item.pseudo == "pattern_rate" then
+    return "pattern rate"
+  elseif param_item.pseudo == "step_length" then
+    return "trig length"
+  elseif param_item.pseudo == "step_velocity" then
+    return "velocity"
+  elseif param_item.id == "default_length" then
+    return "trig length"
+  elseif param_item.id == "default_velocity" then
+    return "velocity"
+  elseif param_item.file then
+    return "sample"
+  end
+
+  local full_id = self:item_param_id(param_item)
+  local param = full_id ~= nil and params:lookup_param(full_id) or nil
+  return (param ~= nil and param.name) or param_item.id
+end
+
+function ParamValues:item_flash_key(param_item)
+  if param_item == nil then
+    return nil
+  end
+  return param_item.lock_id or param_item.id or param_item.pseudo
+end
+
+function ParamValues:flash_item_value(param_item)
+  local key = self:item_flash_key(param_item)
+  if key ~= nil then
+    self.value_flash_until[key] = util.time() + self.value_flash_seconds
+  end
+end
+
+function ParamValues:item_value_flashing(param_item)
+  local key = self:item_flash_key(param_item)
+  return key ~= nil and (self.value_flash_until[key] or 0) > util.time()
+end
+
+function ParamValues:pattern_rate_index()
+  local grid_ui = self.get_grid_ui()
+  if grid_ui ~= nil then
+    return grid_ui.rate_index or 4
+  end
+  return 4
+end
+
+function ParamValues:item_raw_value(param_item)
+  local grid_ui = self.get_grid_ui()
+  if param_item == nil then
+    return 0
+  elseif param_item.blank then
+    return 0
+  elseif param_item.pseudo == "pattern_rate" then
+    return self:pattern_rate_index()
+  elseif param_item.pseudo == "step_length" then
+    local fallback = self.param_value_or("default_length", self.get_default_trig_length())
+    return grid_ui ~= nil and (grid_ui:held_param_lock("length") or fallback) or fallback
+  elseif param_item.pseudo == "step_velocity" then
+    local fallback = self.param_value_or("default_velocity", self.get_default_trig_velocity())
+    return grid_ui ~= nil and (grid_ui:held_param_lock("velocity") or fallback) or fallback
+  elseif param_item.file then
+    return self.sample_name()
+  elseif params:lookup_param(self.id(param_item.id)) ~= nil then
+    local lock_id = param_item.lock_id or param_item.id
+    local step_edit = grid_ui ~= nil and grid_ui.screen_edit ~= nil and grid_ui:screen_edit() or nil
+    if step_edit ~= nil and param_item.lockable == true then
+      local locked = grid_ui:held_param_lock(lock_id)
+      if locked ~= nil then
+        return locked
+      end
+    end
+    if self.active_step_lock_bases[lock_id] ~= nil then
+      return self.active_step_lock_bases[lock_id]
+    end
+    return params:get(self.id(param_item.id))
+  end
+  return 0
+end
+
+function ParamValues:format_item_value(param_item, value)
+  if param_item == nil then
+    return ""
+  elseif param_item.blank then
+    return "---"
+  elseif param_item.id == "machine" then
+    local param = params:lookup_param(self.id("machine"))
+    local options = param ~= nil and param.options or {}
+    local machine = options[math.floor((value or self.param_value_or("machine", 1)) + 0.5)] or self:option_value("machine")
+    if machine == "loop_trig" then
+      return "trig"
+    elseif machine == "grid_slice" then
+      return "grid"
+    elseif machine == "razor_slice" then
+      return "razor"
+    end
+    return machine
+  elseif param_item.id == "mode" then
+    local param = params:lookup_param(self.id("mode"))
+    local options = param ~= nil and param.options or {}
+    local mode = options[math.floor((value or self.param_value_or("mode", 1)) + 0.5)] or self:option_value("mode")
+    if mode == "tempo_varispeed" then
+      return "tempo"
+    elseif mode == "granular" then
+      return "grain"
+    elseif mode == "pitch_corrected" then
+      return "pc"
+    elseif mode == "random_ola" then
+      return "ola"
+    end
+    return mode
+  elseif param_item.pseudo == "pattern_rate" then
+    return rate_label(PATTERN_RATES[math.floor((value or self:pattern_rate_index()) + 0.5)] or 1)
+  elseif param_item.pseudo == "step_length" then
+    return string.format("%.2f", value or self:item_raw_value(param_item))
+  elseif param_item.pseudo == "step_velocity" then
+    return tostring(math.floor(((value or self:item_raw_value(param_item)) * 100) + 0.5))
+  elseif param_item.file then
+    return self.sample_name()
+  elseif param_item.binary then
+    return (value or 0) >= 1 and "on" or "off"
+  elseif param_item.id == "slice_play_mode" then
+    local param = params:lookup_param(self.id(param_item.id))
+    local options = param ~= nil and param.options or {}
+    local mode = options[math.floor((value or self.param_value_or(param_item.id, 1)) + 0.5)] or self:option_value(param_item.id)
+    if mode == "1 shot" then
+      return "shot"
+    elseif mode == "1 shot hold" then
+      return "hold"
+    end
+    return mode
+  elseif param_item.id == "chop_loop_mode" then
+    local param = params:lookup_param(self.id(param_item.id))
+    local options = param ~= nil and param.options or {}
+    local mode = options[math.floor((value or self.param_value_or(param_item.id, 1)) + 0.5)] or self:option_value(param_item.id)
+    if mode == "forward stop" then
+      return "stop"
+    elseif mode == "loop forward" then
+      return "loop"
+    elseif mode == "ping pong" then
+      return "pong"
+    end
+    return mode
+  elseif param_item.options ~= nil then
+    local param = params:lookup_param(self.id(param_item.id))
+    if param ~= nil and param.options ~= nil then
+      return param.options[math.floor((value or params:get(self.id(param_item.id))) + 0.5)] or params:string(self.id(param_item.id))
+    end
+    return tostring(value or "")
+  end
+
+  local formatter = ID_FORMATTERS[param_item.id]
+  if formatter ~= nil then
+    return formatter(value)
+  end
+
+  return tostring(value or "")
+end
+
+function ParamValues:item_display_value(param_item)
+  if param_item ~= nil and param_item.file then
+    return self.sample_name()
+  end
+  local value = self:item_raw_value(param_item)
+  return self:format_item_value(param_item, value)
+end
+
+function ParamValues:snap_value(param_item, current, delta)
+  local snaps = param_item.snaps
+  if snaps == nil or #snaps == 0 then
+    return current
+  end
+
+  if delta >= 0 then
+    for _, value in ipairs(snaps) do
+      if value > current + 0.0001 then
+        return value
+      end
+    end
+    return snaps[#snaps]
+  end
+
+  for i = #snaps, 1, -1 do
+    if snaps[i] < current - 0.0001 then
+      return snaps[i]
+    end
+  end
+  return snaps[1]
+end
+
+function ParamValues:adjusted_value(param_item, current, delta, snap)
+  if param_item.options ~= nil then
+    return util.clamp(math.floor(current + (delta >= 0 and 1 or -1)), 1, param_item.options)
+  elseif snap and param_item.fine_step == nil then
+    return self:snap_value(param_item, current, delta)
+  end
+
+  local step = (self.get_alt() and param_item.fine_step) or param_item.step or 1
+  return util.clamp(current + (delta * step), param_item.min or current, param_item.max or current)
+end
+
+function ParamValues:apply_item_value(param_item, value)
+  local grid_ui = self.get_grid_ui()
+  if param_item == nil then
+    return
+  elseif param_item.file then
+    local select_sample = self.get_select_sample()
+    if select_sample ~= nil then
+      select_sample()
+    end
+  elseif param_item.pseudo == "pattern_rate" then
+    if grid_ui ~= nil then
+      grid_ui.rate_index = util.clamp(math.floor(value + 0.5), 1, #PATTERN_RATES)
+      self.show_message("Pattern Rate " .. rate_label(PATTERN_RATES[grid_ui.rate_index] or 1))
+    end
+  elseif param_item.pseudo == "step_length" then
+    local next_length = util.clamp(value, param_item.min or 0.25, param_item.max or 16)
+    self.set_default_trig_length(next_length)
+    if params:lookup_param(self.id("default_length")) ~= nil then
+      params:set(self.id("default_length"), next_length, true)
+    end
+  elseif param_item.pseudo == "step_velocity" then
+    local next_velocity = util.clamp(value, param_item.min or 0, param_item.max or 1)
+    self.set_default_trig_velocity(next_velocity)
+    if params:lookup_param(self.id("default_velocity")) ~= nil then
+      params:set(self.id("default_velocity"), next_velocity, true)
+    end
+  elseif params:lookup_param(self.id(param_item.id)) ~= nil then
+    params:set(self.id(param_item.id), value)
+  end
+end
+
+function ParamValues:apply_param_lock_value(lock_id, value)
+  -- loop_start/loop_end locks are read directly by GridSequencer:locked_region
+  -- at trigger time; applying them here too would temporarily overwrite the
+  -- persistent track-base param that base_region() reads, which grid
+  -- interactions (release-to-base-region, etc.) rely on staying untouched.
+  if lock_id == "length" or lock_id == "velocity" or lock_id == "loop_start" or lock_id == "loop_end" then
+    return
+  end
+  local full_id = self.id(lock_id)
+  if params:lookup_param(full_id) ~= nil then
+    params:set(full_id, value)
+  end
+end
+
+function ParamValues:apply_step_param_locks(locks)
+  locks = locks or {}
+  self.applying_step_locks = true
+
+  for lock_id, _ in pairs(self.active_step_lock_ids) do
+    if locks[lock_id] == nil then
+      local base = self.active_step_lock_bases[lock_id]
+      if base ~= nil then
+        self:apply_param_lock_value(lock_id, base)
+      end
+      self.active_step_lock_ids[lock_id] = nil
+      self.active_step_lock_bases[lock_id] = nil
+    end
+  end
+
+  for lock_id, value in pairs(locks) do
+    if self.active_step_lock_bases[lock_id] == nil and params:lookup_param(self.id(lock_id)) ~= nil then
+      self.active_step_lock_bases[lock_id] = params:get(self.id(lock_id))
+    end
+    self.active_step_lock_ids[lock_id] = true
+    self:apply_param_lock_value(lock_id, value)
+  end
+  self.applying_step_locks = false
+end
+
+function ParamValues:delta_item(param_item, delta)
+  local grid_ui = self.get_grid_ui()
+  if param_item == nil or param_item.blank then
+    return
+  end
+
+  if param_item.file then
+    self:apply_item_value(param_item, 0)
+    return
+  end
+
+  local lock_id = param_item.lock_id or param_item.id
+  local step_edit = grid_ui ~= nil and grid_ui.screen_edit ~= nil and grid_ui:screen_edit() or nil
+  local locking = step_edit ~= nil and param_item.lockable == true
+  local current = locking and (grid_ui:held_param_lock(lock_id) or self:item_raw_value(param_item)) or self:item_raw_value(param_item)
+  local next_value = self:adjusted_value(param_item, current, delta, self.get_alt())
+
+  if param_item.id == "trim_start" or param_item.id == "trim_end" then
+    self.set_last_trim_focus(param_item.id)
+  end
+
+  if locking then
+    grid_ui:set_held_param_lock(lock_id, next_value)
+    self:flash_item_value(param_item)
+    self.show_message(self:item_long_name(param_item) .. " lock " .. self:format_item_value(param_item, next_value))
+  else
+    self:apply_item_value(param_item, next_value)
+    self:flash_item_value(param_item)
+    self.show_message(self:item_long_name(param_item) .. " " .. self:item_display_value(param_item))
+  end
+end
+
+return ParamValues

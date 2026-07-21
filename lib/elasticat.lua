@@ -1,0 +1,1149 @@
+-- elasticat
+--
+-- Parameter helper for the bundled Engine_Elasticat.
+--
+-- Minimal script usage:
+--   engine.name = "Elasticat"
+--   local elasticat = include("lib/elasticat")
+--   function init()
+--     elasticat.params()
+--   end
+
+local cs = require "controlspec"
+local unpack = table.unpack or unpack
+
+local elasticat = {}
+
+elasticat.machines = {
+  "loop",
+  "loop_trig",
+  "grid_slice",
+  "razor_slice"
+}
+
+elasticat.modes = {
+  "tape",
+  "tempo_varispeed",
+  "chopped",
+  "granular",
+  "random_ola",
+  "pitch_corrected"
+}
+
+local sync_thread = nil
+local engine_send_metro = nil
+local engine_send_interval = 1 / 12
+local pending_engine_sends = {}
+local pending_engine_order = {}
+local clock_origin = 0
+local clock_sequence = 0
+local ids = {}
+local sample_pool = {
+  paths = {},
+  samples = {},
+  rates = {},
+  bpms = {},
+  steps = {},
+  trim_starts = {},
+  trim_ends = {},
+  gains = {}
+}
+local active_sample_slot = 1
+local pool_options = {}
+local pool_dirty = {}
+local suppress_pool_callback = false
+local engine_call = nil
+local send_effective_amp
+local razor_adjusting = false
+local razor_start_values = {}
+local audio_extensions = {
+  wav = true,
+  aif = true,
+  aiff = true,
+  flac = true,
+  ogg = true
+}
+
+local function param_id(prefix, suffix)
+  return prefix .. suffix
+end
+
+local function add_control(id, name, spec, action, formatter)
+  params:add_control(id, name, spec, formatter)
+  params:set_action(id, action)
+end
+
+local function is_audio_file(path)
+  local ext = path:match("%.([^%.]+)$")
+  return ext ~= nil and audio_extensions[ext:lower()] == true
+end
+
+local function bpm_from_filename(path)
+  local bpm = path:match("[Bb][Pp][Mm][_%-%s]*(%d+%.?%d*)")
+    or path:match("(%d+%.?%d*)[_%-%s]*[Bb][Pp][Mm]")
+  if bpm == nil then
+    return nil
+  end
+  return tonumber(bpm)
+end
+
+local function quantize_steps(value)
+  return math.max(1, math.floor(value + 0.5))
+end
+
+local function sample_slot_number(slot)
+  return util.clamp(math.floor((tonumber(slot) or 1) + 0.5), 1, 128)
+end
+
+local function sample_duration(slot)
+  slot = sample_slot_number(slot)
+  local samples = sample_pool.samples[slot] or 0
+  local rate = sample_pool.rates[slot] or 0
+  if samples <= 0 or rate <= 0 then
+    return 0
+  end
+  return samples / rate
+end
+
+local function sample_meta_path(path)
+  if path == nil or path == "" or path == "-" or path:sub(-1) == "/" then
+    return nil
+  end
+  local replaced = path:gsub("%.[^%.\\/]+$", ".json")
+  if replaced == path then
+    return path .. ".json"
+  end
+  return replaced
+end
+
+local function read_sample_sidecar(path)
+  local meta_path = sample_meta_path(path)
+  if meta_path == nil or not util.file_exists(meta_path) then
+    return {}
+  end
+
+  local file = io.open(meta_path, "rb")
+  if file == nil then
+    return {}
+  end
+  local content = file:read("*all") or ""
+  file:close()
+
+  return {
+    bpm = tonumber(content:match('"bpm"%s*:%s*([%d%.%-]+)')),
+    steps = tonumber(content:match('"steps"%s*:%s*([%d%.%-]+)')),
+    trim_start = tonumber(content:match('"trim_start"%s*:%s*([%d%.%-]+)')),
+    trim_end = tonumber(content:match('"trim_end"%s*:%s*([%d%.%-]+)')),
+    gain = tonumber(content:match('"gain"%s*:%s*([%d%.%-]+)'))
+  }
+end
+
+local function write_sample_sidecar(slot)
+  slot = sample_slot_number(slot)
+  local path = sample_pool.paths[slot]
+  local meta_path = sample_meta_path(path)
+  if meta_path == nil then
+    return
+  end
+
+  local file = io.open(meta_path, "wb")
+  if file == nil then
+    print("elasticat: could not write sample sidecar " .. tostring(meta_path))
+    return
+  end
+
+  file:write(string.format(
+    '{\n  "bpm": %.6f,\n  "steps": %.6f,\n  "trim_start": %.6f,\n  "trim_end": %.6f,\n  "gain": %.6f\n}\n',
+    sample_pool.bpms[slot] or 120,
+    sample_pool.steps[slot] or 16,
+    sample_pool.trim_starts[slot] or 0,
+    sample_pool.trim_ends[slot] or sample_duration(slot),
+    sample_pool.gains[slot] or 1
+  ))
+  file:close()
+end
+
+local function trim_bounds(slot)
+  slot = sample_slot_number(slot or active_sample_slot)
+  local duration = sample_duration(slot)
+  local trim_start = util.clamp(sample_pool.trim_starts[slot] or 0, 0, math.max(0, duration))
+  local trim_end = util.clamp(sample_pool.trim_ends[slot] or duration, 0, math.max(0, duration))
+  if duration > 0 and trim_end <= trim_start then
+    trim_end = duration
+    if trim_end <= trim_start then
+      trim_start = 0
+    end
+  end
+  return trim_start, trim_end, duration
+end
+
+local function map_trim_point(point, slot)
+  local trim_start, trim_end, duration = trim_bounds(slot)
+  if duration <= 0 then
+    return util.clamp(point or 0, 0, 128)
+  end
+  local fraction = util.clamp(point or 0, 0, 128) / 128
+  return ((trim_start + ((trim_end - trim_start) * fraction)) / duration) * 128
+end
+
+local function update_engine_loop_points()
+  if ids.loop_start == nil or ids.loop_end == nil then
+    return
+  end
+  local start_point = params:lookup_param(ids.loop_start) ~= nil and params:get(ids.loop_start) or 0
+  local end_point = params:lookup_param(ids.loop_end) ~= nil and params:get(ids.loop_end) or 128
+  engine_call("loopStart", map_trim_point(start_point))
+  engine_call("loopEnd", map_trim_point(end_point))
+end
+
+local function format_ms(param)
+  return tostring(math.floor((param:get() * 1000) + 0.5)) .. " ms"
+end
+
+local function clock_param_is_internal()
+  return params:lookup_param("clock_source") ~= nil and params:get("clock_source") == 1
+end
+
+local function set_internal_clock_tempo(bpm)
+  if ids.clock_sync ~= nil and params:get(ids.clock_sync) ~= 1 then
+    return
+  end
+  if not clock_param_is_internal() then
+    return
+  end
+
+  if params:lookup_param("clock_tempo") ~= nil then
+    params:set("clock_tempo", bpm)
+  elseif clock.internal ~= nil and clock.internal.set_tempo ~= nil then
+    clock.internal.set_tempo(bpm)
+  end
+end
+
+local function load_sample(path)
+  if engine.loadSample ~= nil then
+    print("elasticat: sending engine.loadSample " .. path)
+    engine.loadSample(path)
+  elseif engine.commands ~= nil and engine.commands.load ~= nil then
+    -- Older compiled Elasticat versions registered a command named "load".
+    -- Call through the command table to avoid norns' reserved engine.load().
+    print("elasticat: sending legacy engine command load " .. path)
+    engine.commands.load.func(path)
+  else
+    print("elasticat: engine loadSample command missing; restart/recompile norns")
+  end
+end
+
+engine_call = function(name, ...)
+  if engine[name] ~= nil then
+    engine[name](...)
+  else
+    print("elasticat: engine command missing: " .. name)
+  end
+end
+
+local function notify_pool_change(kind, slot, path)
+  if suppress_pool_callback then
+    return
+  end
+  if pool_options.on_pool_change ~= nil then
+    pool_options.on_pool_change(elasticat.pool_snapshot(), slot, path, kind)
+  end
+end
+
+-- Sidecar/pool-state disk writes are deferred: edits (trim, bpm, steps, gain)
+-- just mark the slot dirty and update the screen/engine live. The actual
+-- write only happens on flush (sample-slot change, page navigation, or
+-- script cleanup), so scrubbing an encoder never triggers disk I/O per tick.
+local function mark_pool_dirty(slot)
+  pool_dirty[sample_slot_number(slot)] = true
+end
+
+function elasticat.flush_dirty_pool_state()
+  local flushed_slot = nil
+  for slot, dirty in pairs(pool_dirty) do
+    if dirty then
+      write_sample_sidecar(slot)
+      pool_dirty[slot] = nil
+      flushed_slot = flushed_slot or slot
+    end
+  end
+  if flushed_slot ~= nil then
+    notify_pool_change("flush", active_sample_slot, sample_pool.paths[active_sample_slot])
+  end
+end
+
+local function load_sample_slot(slot, path)
+  slot = sample_slot_number(slot)
+  if engine.loadPoolSlot ~= nil then
+    print("elasticat: sending engine.loadPoolSlot " .. tostring(slot) .. " " .. path)
+    engine_call("loadPoolSlot", slot, path)
+  elseif slot == active_sample_slot then
+    load_sample(path)
+  else
+    print("elasticat: engine loadPoolSlot command missing; slot " .. tostring(slot) .. " cached in script only")
+  end
+end
+
+local function apply_slot_metadata(slot)
+  slot = sample_slot_number(slot)
+  local bpm = sample_pool.bpms[slot]
+  local steps = sample_pool.steps[slot]
+  local trim_start = sample_pool.trim_starts[slot]
+  local trim_end = sample_pool.trim_ends[slot]
+  local source_bpm_id = ids.sample_bpm ~= nil and ids.sample_bpm:gsub("sample_bpm$", "source_bpm") or nil
+
+  if bpm ~= nil and params:lookup_param(ids.sample_bpm) ~= nil then
+    params:set(ids.sample_bpm, bpm, true)
+    if source_bpm_id ~= nil and params:lookup_param(source_bpm_id) ~= nil then
+      params:set(source_bpm_id, bpm, true)
+    end
+    engine_call("sourceBpm", bpm)
+  end
+
+  if steps ~= nil and params:lookup_param(ids.sample_steps) ~= nil then
+    params:set(ids.sample_steps, steps, true)
+    engine_call("setSampleSteps", steps)
+  end
+
+  if trim_start ~= nil and ids.trim_start ~= nil and params:lookup_param(ids.trim_start) ~= nil then
+    params:set(ids.trim_start, trim_start, true)
+  end
+
+  if trim_end ~= nil and ids.trim_end ~= nil and params:lookup_param(ids.trim_end) ~= nil then
+    params:set(ids.trim_end, trim_end, true)
+  end
+
+  if ids.gain ~= nil and params:lookup_param(ids.gain) ~= nil then
+    params:set(ids.gain, sample_pool.gains[slot] or 1, true)
+  end
+  send_effective_amp()
+
+  update_engine_loop_points()
+end
+
+local function sync_sample_file_param(path)
+  if ids.sample ~= nil and params:lookup_param(ids.sample) ~= nil then
+    params:set(ids.sample, path or _path.audio, true)
+  end
+end
+
+local function set_active_pool_slot(slot)
+  slot = sample_slot_number(slot)
+  if slot ~= active_sample_slot then
+    elasticat.flush_dirty_pool_state()
+  end
+  active_sample_slot = slot
+
+  if ids.sample_slot ~= nil and params:lookup_param(ids.sample_slot) ~= nil then
+    if math.floor((params:get(ids.sample_slot) or 1) + 0.5) ~= slot then
+      params:set(ids.sample_slot, slot, true)
+    end
+  end
+
+  sync_sample_file_param(sample_pool.paths[slot])
+  apply_slot_metadata(slot)
+  engine_call("setSampleSlot", slot)
+
+  if not suppress_pool_callback and pool_options.on_sample_slot ~= nil then
+    pool_options.on_sample_slot(slot, sample_pool.paths[slot])
+  end
+end
+
+local flush_engine_sends
+
+local function ensure_engine_send_metro()
+  if engine_send_metro == nil then
+    engine_send_metro = metro.init(function()
+      flush_engine_sends()
+    end, engine_send_interval, -1)
+  end
+  if engine_send_metro ~= nil and not engine_send_metro.is_running then
+    engine_send_metro:start()
+  end
+end
+
+local function queue_engine_send(key, action)
+  if pending_engine_sends[key] == nil then
+    table.insert(pending_engine_order, key)
+  end
+  pending_engine_sends[key] = action
+  ensure_engine_send_metro()
+end
+
+local function queue_engine_call(key, name, ...)
+  local args = {...}
+  queue_engine_send(key, function()
+    engine_call(name, unpack(args))
+  end)
+end
+
+-- The engine only has one gain input (setAmp); the per-sample "gain" param
+-- is a script-side multiplier on top of the track/master amp param, so both
+-- combine into that single engine send instead of needing a second engine
+-- parameter.
+send_effective_amp = function()
+  if ids.amp == nil or params:lookup_param(ids.amp) == nil then
+    return
+  end
+  local base = params:get(ids.amp)
+  local gain = sample_pool.gains[active_sample_slot] or 1
+  queue_engine_call(ids.amp, "setAmp", base * gain)
+end
+
+flush_engine_sends = function()
+  local sends = pending_engine_sends
+  local order = pending_engine_order
+  pending_engine_sends = {}
+  pending_engine_order = {}
+
+  for _, key in ipairs(order) do
+    if sends[key] ~= nil then
+      sends[key]()
+    end
+  end
+
+  if next(pending_engine_sends) == nil and engine_send_metro ~= nil then
+    engine_send_metro:stop()
+  end
+end
+
+local function reset_clock_origin()
+  clock_origin = clock.get_beats()
+  clock_sequence = 0
+end
+
+local function set_engine_play(x)
+  print("elasticat: params/play action " .. tostring(x))
+  if x == 1 and ids.clock_sync ~= nil and params:get(ids.clock_sync) == 1 then
+    reset_clock_origin()
+    engine_call("setPlayhead", 0)
+  end
+  engine_call("play", x)
+end
+
+local function send_clock_observation()
+  if ids.target_bpm == nil or ids.sample_steps == nil then
+    return
+  end
+
+  local tempo = clock.get_tempo()
+  local beats = clock.get_beats()
+  local start_point = params:get(ids.loop_start) or 0
+  local end_point = params:get(ids.loop_end) or 128
+  local region = math.max(0.01, end_point - start_point) / 128
+  local loop_beats = math.max(0.25, (params:get(ids.sample_steps) * region) / 4)
+  local expected_phase = ((beats - clock_origin) / loop_beats) % 1
+
+  clock_sequence = clock_sequence + 1
+  params:set(ids.target_bpm, tempo, true)
+
+  if engine.syncClock ~= nil then
+    engine.syncClock(expected_phase, tempo, clock_sequence)
+  elseif engine.targetBpm ~= nil then
+    engine.targetBpm(tempo)
+  end
+end
+
+function elasticat.stop_clock_sync()
+  if sync_thread ~= nil then
+    clock.cancel(sync_thread)
+    sync_thread = nil
+  end
+end
+
+function elasticat.stop_param_throttle()
+  pending_engine_sends = {}
+  pending_engine_order = {}
+  if engine_send_metro ~= nil then
+    engine_send_metro:stop()
+    engine_send_metro = nil
+  end
+end
+
+function elasticat.start_clock_sync()
+  elasticat.stop_clock_sync()
+  reset_clock_origin()
+  sync_thread = clock.run(function()
+    while true do
+      clock.sync(1 / 4)
+      if params:get(ids.clock_sync) == 1 then
+        send_clock_observation()
+      end
+    end
+  end)
+end
+
+function elasticat.log_engine_commands()
+  print("elasticat: command loadSample = " .. tostring(engine.loadSample ~= nil))
+  print("elasticat: command loadPoolSlot = " .. tostring(engine.loadPoolSlot ~= nil))
+  print("elasticat: command setSampleSlot = " .. tostring(engine.setSampleSlot ~= nil))
+  print("elasticat: command legacy load = " .. tostring(engine.commands ~= nil and engine.commands.load ~= nil))
+  print("elasticat: command play = " .. tostring(engine.play ~= nil))
+  print("elasticat: command setMode = " .. tostring(engine.setMode ~= nil))
+  print("elasticat: command syncClock = " .. tostring(engine.syncClock ~= nil))
+  print("elasticat: command triggerSlice = " .. tostring(engine.triggerSlice ~= nil))
+  print("elasticat: command setSliceSyncToClock = " .. tostring(engine.setSliceSyncToClock ~= nil))
+  print("elasticat: command setSliceRate = " .. tostring(engine.setSliceRate ~= nil))
+end
+
+function elasticat.play(state)
+  set_engine_play(state and 1 or 0)
+end
+
+function elasticat.stop_reset()
+  flush_engine_sends()
+  if engine.stopAndReset ~= nil then
+    engine_call("stopAndReset")
+  elseif engine.stop ~= nil then
+    engine_call("stop")
+  else
+    engine_call("play", 0)
+    engine_call("playhead", 0)
+  end
+end
+
+function elasticat.request_status()
+  engine_call("requestStatus")
+end
+
+function elasticat.set_pitch(value)
+  engine_call("setPitch", value)
+end
+
+function elasticat.set_reverse(reverse)
+  engine_call("setReverse", (reverse == true or reverse == 1) and 1 or 0)
+end
+
+function elasticat.trigger_slice(slice_index, start_point, end_point, play_mode, reverse, velocity, length_seconds, pitch_value)
+  local reverse_flag = (reverse == true or reverse == 1) and 1 or 0
+  engine_call(
+    "triggerSlice",
+    slice_index,
+    map_trim_point(start_point),
+    map_trim_point(end_point),
+    play_mode,
+    reverse_flag,
+    velocity or 1,
+    length_seconds or 0,
+    pitch_value or 0
+  )
+end
+
+function elasticat.release_slice(slice_index)
+  engine_call("releaseSlice", slice_index)
+end
+
+function elasticat.release_all_slices()
+  engine_call("releaseAllSlices")
+end
+
+function elasticat.set_loop_region(start_point, end_point, reset_playhead)
+  flush_engine_sends()
+  local engine_start = map_trim_point(start_point)
+  local engine_end = map_trim_point(end_point)
+  if reset_playhead ~= nil and engine.loopRegionPlayhead ~= nil then
+    local phase = type(reset_playhead) == "number" and reset_playhead or 0
+    engine_call("loopRegionPlayhead", engine_start, engine_end, phase)
+    return
+  end
+
+  engine_call("loopStart", engine_start)
+  engine_call("loopEnd", engine_end)
+  if type(reset_playhead) == "number" then
+    engine_call("playhead", reset_playhead)
+  elseif reset_playhead then
+    engine_call("playhead", 0)
+  end
+end
+
+function elasticat.active_pool_slot()
+  return active_sample_slot
+end
+
+function elasticat.pool_path(slot)
+  return sample_pool.paths[sample_slot_number(slot or active_sample_slot)]
+end
+
+function elasticat.pool_label(slot)
+  local path = elasticat.pool_path(slot)
+  if path == nil or path == "" or path == "-" or path:sub(-1) == "/" then
+    return "empty"
+  end
+  return path:match("[^/\\]+$") or path
+end
+
+function elasticat.pool_meta(slot)
+  slot = sample_slot_number(slot or active_sample_slot)
+  return {
+    path = sample_pool.paths[slot],
+    samples = sample_pool.samples[slot],
+    rate = sample_pool.rates[slot],
+    bpm = sample_pool.bpms[slot],
+    steps = sample_pool.steps[slot],
+    trim_start = sample_pool.trim_starts[slot],
+    trim_end = sample_pool.trim_ends[slot],
+    gain = sample_pool.gains[slot] or 1,
+    duration = sample_duration(slot)
+  }
+end
+
+function elasticat.pool_snapshot()
+  local snapshot = {}
+  for slot = 1, 128 do
+    if sample_pool.paths[slot] ~= nil then
+      snapshot[slot] = {
+        path = sample_pool.paths[slot],
+        bpm = sample_pool.bpms[slot],
+        steps = sample_pool.steps[slot],
+        trim_start = sample_pool.trim_starts[slot],
+        trim_end = sample_pool.trim_ends[slot],
+        gain = sample_pool.gains[slot]
+      }
+    end
+  end
+  return snapshot
+end
+
+function elasticat.set_pool_slot(slot)
+  set_active_pool_slot(slot)
+end
+
+function elasticat.load_pool_slot(slot, path, make_active)
+  slot = sample_slot_number(slot)
+  print("elasticat: pool slot " .. tostring(slot) .. " load " .. tostring(path))
+  if path == nil or path == "-" or path == "" or path:sub(-1) == "/" or not is_audio_file(path) then
+    print("elasticat: pool slot " .. tostring(slot) .. " ignored non-audio path")
+    return false
+  end
+  if not util.file_exists(path) then
+    print("elasticat: pool slot " .. tostring(slot) .. " missing " .. path)
+    return false
+  end
+
+  local _, samples, rate = audio.file_info(path)
+  print("elasticat: audio.file_info slot=" .. tostring(slot) .. " samples=" .. tostring(samples) .. " rate=" .. tostring(rate))
+  if (samples or 0) <= 0 or (rate or 0) <= 0 then
+    print("elasticat: not an audio file: " .. path)
+    return false
+  end
+
+  local filename_bpm = bpm_from_filename(path)
+  local sidecar = read_sample_sidecar(path)
+  local duration = samples / rate
+  local bpm = sidecar.bpm or filename_bpm or sample_pool.bpms[slot] or (params:lookup_param(ids.sample_bpm) ~= nil and params:get(ids.sample_bpm) or 120)
+  local inferred_steps = quantize_steps((samples / rate) * bpm / 60 * 4)
+  local steps = sidecar.steps or inferred_steps
+  local trim_start = util.clamp(sidecar.trim_start or sample_pool.trim_starts[slot] or 0, 0, duration)
+  local trim_end = util.clamp(sidecar.trim_end or sample_pool.trim_ends[slot] or duration, 0, duration)
+  if trim_end <= trim_start then
+    trim_start = 0
+    trim_end = duration
+  end
+  local gain = sidecar.gain or sample_pool.gains[slot] or 1
+
+  sample_pool.paths[slot] = path
+  sample_pool.samples[slot] = samples
+  sample_pool.rates[slot] = rate
+  sample_pool.bpms[slot] = bpm
+  sample_pool.steps[slot] = steps
+  sample_pool.trim_starts[slot] = trim_start
+  sample_pool.trim_ends[slot] = trim_end
+  sample_pool.gains[slot] = gain
+
+  if make_active then
+    set_active_pool_slot(slot)
+  end
+
+  flush_engine_sends()
+  load_sample_slot(slot, path)
+  notify_pool_change("load", slot, path)
+  return true
+end
+
+function elasticat.load_pool_paths(paths, selected_slot)
+  if type(paths) ~= "table" then
+    return
+  end
+
+  suppress_pool_callback = true
+  selected_slot = sample_slot_number(selected_slot or active_sample_slot)
+  for slot = 1, 128 do
+    local entry = paths[slot] or paths[tostring(slot)]
+    local path = type(entry) == "table" and entry.path or entry
+    if path ~= nil and path ~= "" and path ~= "-" and util.file_exists(path) then
+      elasticat.load_pool_slot(slot, path, slot == selected_slot)
+      if type(entry) == "table" then
+        sample_pool.bpms[slot] = tonumber(entry.bpm) or sample_pool.bpms[slot]
+        sample_pool.steps[slot] = tonumber(entry.steps) or sample_pool.steps[slot]
+        sample_pool.trim_starts[slot] = tonumber(entry.trim_start) or sample_pool.trim_starts[slot]
+        sample_pool.trim_ends[slot] = tonumber(entry.trim_end) or sample_pool.trim_ends[slot]
+        sample_pool.gains[slot] = tonumber(entry.gain) or sample_pool.gains[slot]
+        if slot == selected_slot then
+          apply_slot_metadata(slot)
+        end
+      end
+    end
+  end
+  suppress_pool_callback = false
+  notify_pool_change("restore", selected_slot, sample_pool.paths[selected_slot])
+end
+
+function elasticat.params(options)
+  options = options or {}
+  pool_options = options
+  local prefix = options.prefix or "elasticat_"
+  local default_sync = options.clock_sync == false and 0 or 1
+
+  ids.sample_slot = param_id(prefix, "sample_slot")
+  ids.sample = param_id(prefix, "sample")
+  ids.machine = param_id(prefix, "machine")
+  ids.mode = param_id(prefix, "mode")
+  ids.play = param_id(prefix, "play")
+  ids.clock_sync = param_id(prefix, "clock_sync")
+  ids.target_bpm = param_id(prefix, "target_bpm")
+  ids.sample_bpm = param_id(prefix, "sample_bpm")
+  ids.sample_steps = param_id(prefix, "sample_steps")
+  ids.trim_start = param_id(prefix, "trim_start")
+  ids.trim_end = param_id(prefix, "trim_end")
+  ids.gain = param_id(prefix, "gain")
+  ids.amp = param_id(prefix, "amp")
+  ids.loop_division = param_id(prefix, "loop_division")
+  ids.trig_polyphony = param_id(prefix, "trig_polyphony")
+  ids.playhead_return = param_id(prefix, "playhead_return")
+  ids.pattern_steps = param_id(prefix, "pattern_steps")
+  ids.default_length = param_id(prefix, "default_length")
+  ids.default_velocity = param_id(prefix, "default_velocity")
+  ids.loop_start = param_id(prefix, "loop_start")
+  ids.loop_end = param_id(prefix, "loop_end")
+  ids.mode_macro = param_id(prefix, "mode_macro")
+  ids.mode_switch_fade = param_id(prefix, "mode_switch_fade")
+  ids.debug = param_id(prefix, "debug")
+  ids.live_performance_mode = param_id(prefix, "live_performance_mode")
+  ids.step_preview = param_id(prefix, "step_preview")
+
+  local function apply_current_mode_params()
+    local mode = params:get(ids.mode)
+    if mode == 1 or mode == 2 then
+      engine_call("loopStart", map_trim_point(params:get(ids.loop_start)))
+      engine_call("loopEnd", map_trim_point(params:get(ids.loop_end)))
+    elseif mode == 3 then
+      engine_call("chopSteps", params:get(param_id(prefix, "chop_steps")))
+      engine_call("chopLoopMode", params:get(param_id(prefix, "chop_loop_mode")) - 1)
+      engine_call("chopAttack", params:get(param_id(prefix, "chop_attack")))
+      engine_call("chopHold", params:get(param_id(prefix, "chop_hold")))
+      engine_call("chopRelease", params:get(param_id(prefix, "chop_release")))
+    elseif mode == 4 then
+      engine_call("grainSize", params:get(param_id(prefix, "grain_size")))
+      engine_call("grainDensity", params:get(param_id(prefix, "grain_density")))
+      engine_call("grainJitter", params:get(param_id(prefix, "grain_jitter")))
+    elseif mode == 5 then
+      engine_call("wsolaWindow", params:get(param_id(prefix, "wsola_window")))
+      engine_call("wsolaSearch", params:get(param_id(prefix, "wsola_search")))
+    elseif mode == 6 then
+      engine_call("pvWindow", params:get(param_id(prefix, "pv_window")))
+      engine_call("pvDispersion", params:get(param_id(prefix, "pv_dispersion")))
+    end
+  end
+
+  params:add_group(param_id(prefix, "group_setup"), "elasticat setup", 18)
+
+  add_control(ids.sample_slot, "sample slot",
+    cs.new(1, 128, "lin", 1, 1, "", 1 / 127),
+    function(x)
+      set_active_pool_slot(x)
+    end,
+    function(param) return tostring(math.floor(param:get() + 0.5)) end)
+
+  params:add_file(ids.sample, "sample", options.sample or _path.audio)
+  params:set_action(ids.sample, function(path)
+    print("elasticat: sample param action " .. tostring(path))
+    if path ~= nil and path ~= "-" and path ~= "" and is_audio_file(path) then
+      if not elasticat.load_pool_slot(active_sample_slot, path, true) then
+        params:set(ids.sample, _path.audio, true)
+      end
+    end
+  end)
+
+  params:add_option(ids.machine, "machine", elasticat.machines, 1)
+  params:set_action(ids.machine, function(x)
+    flush_engine_sends()
+    engine_call("setMode", params:get(ids.mode) - 1)
+    apply_current_mode_params()
+    if x == 1 then
+      engine_call("play", params:get(ids.play))
+    else
+      engine_call("play", 0)
+    end
+  end)
+
+  params:add_option(ids.mode, "engine mode", elasticat.modes, 1)
+  params:set_action(ids.mode, function(x)
+    flush_engine_sends()
+    engine_call("setMode", x - 1)
+    apply_current_mode_params()
+  end)
+
+  -- Lua-side grid-interaction settings only; never sent to the engine.
+  add_control(ids.loop_division, "loop key division",
+    cs.new(2, 32, "lin", 2, 16, "", 2 / 30),
+    function(_) end,
+    function(param) return tostring(math.floor(param:get() + 0.5)) end)
+
+  params:add_option(ids.trig_polyphony, "trig polyphony", {"mono", "poly"}, 1)
+
+  -- Where the playhead lands when the last live loop key is released during
+  -- playback: return (rejoin the sequence), boomerang (keep going from the
+  -- current position), reset (jump to the region start). grid_sequencer reads
+  -- this live; no engine action.
+  params:add_option(ids.playhead_return, "playhead return", {"return", "boomerang", "reset"}, 2)
+
+  add_control(ids.mode_macro, "mode macro",
+    cs.new(0, 1, "lin", 0.001, 0, "", 0.001),
+    function(x) queue_engine_call(ids.mode_macro, "setModeMacro", x) end)
+
+  params:add_binary(ids.play, "play", "toggle", 0)
+  params:set_action(ids.play, set_engine_play)
+
+  params:add_binary(ids.clock_sync, "clock sync", "toggle", default_sync)
+  params:set_action(ids.clock_sync, function(x)
+    if x == 1 then
+      send_clock_observation()
+      elasticat.start_clock_sync()
+    else
+      elasticat.stop_clock_sync()
+    end
+  end)
+
+  -- Pure UI-behavior toggles, no engine action: live performance mode governs
+  -- whether held loop keys override the sequencer during playback (grid_sequencer
+  -- reads this live), and step preview gates whether holding a step/loop key while
+  -- stopped audibly previews it.
+  params:add_binary(ids.live_performance_mode, "live performance mode", "toggle", 0)
+  params:add_binary(ids.step_preview, "step preview", "toggle", 1)
+
+  add_control(ids.amp, "amp",
+    cs.new(0, 2, "lin", 0.01, 0.8, "", 0.005),
+    function(_) send_effective_amp() end)
+
+  add_control(param_id(prefix, "pan"), "pan",
+    cs.new(-1, 1, "lin", 0.01, 0, "", 0.005),
+    function(x) queue_engine_call(param_id(prefix, "pan"), "setPan", x) end)
+
+  add_control(param_id(prefix, "source_bpm"), "derived source bpm",
+    cs.new(20, 300, "lin", 0.1, 120, "bpm", 1 / 280),
+    function(_) end)
+
+  add_control(ids.target_bpm, "target bpm",
+    cs.new(20, 300, "lin", 1, 120, "bpm", 1 / 280),
+    function(x)
+      queue_engine_send(ids.target_bpm, function()
+        set_internal_clock_tempo(x)
+        engine_call("targetBpm", x)
+      end)
+    end)
+
+  add_control(ids.sample_bpm, "sample bpm",
+    cs.new(20, 300, "lin", 1, 120, "bpm", 1 / 280),
+    function(x)
+      sample_pool.bpms[active_sample_slot] = x
+      if params:lookup_param(param_id(prefix, "source_bpm")) ~= nil then
+        params:set(param_id(prefix, "source_bpm"), x, true)
+      end
+      mark_pool_dirty(active_sample_slot)
+      queue_engine_call(ids.sample_bpm, "sourceBpm", x)
+    end)
+
+  add_control(ids.sample_steps, "sample steps",
+    cs.new(1, 512, "lin", 1, 16, "", 1 / 511),
+    function(x)
+      sample_pool.steps[active_sample_slot] = x
+      mark_pool_dirty(active_sample_slot)
+      queue_engine_call(ids.sample_steps, "setSampleSteps", x)
+    end,
+    function(param) return tostring(math.floor(param:get() + 0.5)) end)
+
+  add_control(ids.trim_start, "sample trim start",
+    cs.new(0, 3600, "lin", 0.001, 0, "s", 0.001),
+    function(x)
+      local slot = active_sample_slot
+      local prev_start, prev_end, duration = trim_bounds(slot)
+      -- Dragging trim start shifts trim end by the same amount, so the
+      -- trimmed length stays constant while scrubbing -- unless trim end is
+      -- pinned at the sample's actual end, in which case it stops there and
+      -- further start movement just shortens the trim. Deriving trim end
+      -- from its own previous value (not a remembered "original" length)
+      -- means it un-pins the instant start moves back the other way.
+      local next_start = util.clamp(x, 0, duration)
+      local delta = next_start - prev_start
+      local next_end = util.clamp(prev_end + delta, 0, duration)
+      next_start = util.clamp(next_start, 0, math.max(0, next_end - 0.001))
+      sample_pool.trim_starts[slot] = next_start
+      sample_pool.trim_ends[slot] = next_end
+      if math.abs(next_start - x) > 0.000001 then
+        params:set(ids.trim_start, next_start, true)
+      end
+      if math.abs(next_end - prev_end) > 0.000001 then
+        params:set(ids.trim_end, next_end, true)
+      end
+      update_engine_loop_points()
+      mark_pool_dirty(slot)
+    end,
+    function(param) return string.format("%.3f s", param:get()) end)
+
+  add_control(ids.trim_end, "sample trim end",
+    cs.new(0, 3600, "lin", 0.001, 0, "s", 0.001),
+    function(x)
+      local slot = active_sample_slot
+      local trim_start, _, duration = trim_bounds(slot)
+      local next_end = util.clamp(x, math.min(duration, trim_start + 0.001), duration)
+      sample_pool.trim_ends[slot] = next_end
+      if math.abs(next_end - x) > 0.000001 then
+        params:set(ids.trim_end, next_end, true)
+      end
+      update_engine_loop_points()
+      mark_pool_dirty(slot)
+    end,
+    function(param) return string.format("%.3f s", param:get()) end)
+
+  add_control(ids.gain, "sample gain",
+    cs.new(0, 4, "lin", 0.01, 1, "x", 0.005),
+    function(x)
+      local slot = active_sample_slot
+      sample_pool.gains[slot] = x
+      send_effective_amp()
+      mark_pool_dirty(slot)
+    end,
+    function(param) return string.format("%.2fx", param:get()) end)
+
+  add_control(ids.pattern_steps, "pattern steps",
+    cs.new(1, 256, "lin", 1, 16, "", 1 / 255),
+    function(_) end,
+    function(param) return tostring(math.floor(param:get() + 0.5)) end)
+
+  add_control(ids.default_length, "default trig length",
+    cs.new(0.25, 16, "lin", 0.25, 1, "", 0.25 / 15.75),
+    function(_) end,
+    function(param) return string.format("%.2f", param:get()) end)
+
+  add_control(ids.default_velocity, "default velocity",
+    cs.new(0, 1, "lin", 0.01, 1, "", 0.01),
+    function(_) end,
+    function(param) return tostring(math.floor((param:get() * 100) + 0.5)) end)
+
+  params:add_group(param_id(prefix, "group_loop"), "loop playback", 6)
+
+  add_control(param_id(prefix, "playhead"), "playhead",
+    cs.new(0, 1, "lin", 0.001, 0, "", 0.001),
+    function(x) queue_engine_call(param_id(prefix, "playhead"), "setPlayhead", x) end)
+  if params.hide ~= nil then
+    params:hide(param_id(prefix, "playhead"))
+  end
+
+  add_control(ids.loop_start, "sample start",
+    cs.new(0, 128, "lin", 0.01, 0, "", 1 / 128),
+    function(x) queue_engine_call(ids.loop_start, "loopStart", map_trim_point(x)) end)
+
+  add_control(ids.loop_end, "sample end",
+    cs.new(0, 128, "lin", 0.01, 128, "", 1 / 128),
+    function(x) queue_engine_call(ids.loop_end, "loopEnd", map_trim_point(x)) end)
+
+  add_control(param_id(prefix, "xfade"), "loop xfade",
+    cs.new(0, 0.25, "lin", 0.001, 0.005, "", 0.004),
+    function(x) queue_engine_call(param_id(prefix, "xfade"), "xfade", x) end,
+    format_ms)
+
+  add_control(param_id(prefix, "pitch"), "pitch",
+    cs.new(-24, 24, "lin", 0.1, 0, "st", 0.1 / 48),
+    function(x) queue_engine_call(param_id(prefix, "pitch"), "setPitch", x) end)
+
+  params:add_binary(param_id(prefix, "loop_reverse"), "loop reverse", "toggle", 0)
+  params:set_action(param_id(prefix, "loop_reverse"), function(x)
+    queue_engine_call(param_id(prefix, "loop_reverse"), "setReverse", x)
+  end)
+
+  params:add_group(param_id(prefix, "group_engine_modes"), "engine algorithms", 13)
+
+  add_control(ids.mode_switch_fade, "mode switch fade",
+    cs.new(0.001, 0.25, "lin", 0.001, 0.05, "", 0.001 / 0.249),
+    function(x) queue_engine_call(ids.mode_switch_fade, "setModeSwitchFade", x) end)
+
+  add_control(param_id(prefix, "chop_steps"), "chop steps",
+    cs.new(0.25, 16, "lin", 0.25, 1, "steps", 0.25 / 15.75),
+    function(x) queue_engine_call(param_id(prefix, "chop_steps"), "chopSteps", x) end)
+
+  params:add_option(param_id(prefix, "chop_loop_mode"), "chop loop mode", {"forward stop", "loop forward", "ping pong"}, 1)
+  params:set_action(param_id(prefix, "chop_loop_mode"), function(x) engine_call("chopLoopMode", x - 1) end)
+
+  add_control(param_id(prefix, "chop_attack"), "chop attack",
+    cs.new(0.0001, 0.2, "lin", 0.0001, 0.002, "s", 0.0005 / 0.1999),
+    function(x) queue_engine_call(param_id(prefix, "chop_attack"), "chopAttack", x) end,
+    format_ms)
+
+  add_control(param_id(prefix, "chop_hold"), "chop hold",
+    cs.new(0, 0.5, "lin", 0.001, 0.04, "s", 0.001 / 0.5),
+    function(x) queue_engine_call(param_id(prefix, "chop_hold"), "chopHold", x) end,
+    format_ms)
+
+  add_control(param_id(prefix, "chop_release"), "chop release",
+    cs.new(0.0001, 0.2, "lin", 0.0001, 0.01, "s", 0.0005 / 0.1999),
+    function(x) queue_engine_call(param_id(prefix, "chop_release"), "chopRelease", x) end,
+    format_ms)
+
+  add_control(param_id(prefix, "grain_size"), "grain size",
+    cs.new(0.002, 0.5, "lin", 0.001, 0.08, "s", 0.001 / 0.498),
+    function(x) queue_engine_call(param_id(prefix, "grain_size"), "grainSize", x) end,
+    format_ms)
+
+  add_control(param_id(prefix, "grain_density"), "grain density",
+    cs.new(1, 64, "lin", 1, 8, "gr/step", 1 / 63),
+    function(x) queue_engine_call(param_id(prefix, "grain_density"), "grainDensity", x) end)
+
+  add_control(param_id(prefix, "grain_jitter"), "grain jitter",
+    cs.new(0, 0.25, "lin", 0.001, 0.01, "s", 0.001 / 0.25),
+    function(x) queue_engine_call(param_id(prefix, "grain_jitter"), "grainJitter", x) end,
+    format_ms)
+
+  add_control(param_id(prefix, "wsola_window"), "OLA window",
+    cs.new(0.005, 0.5, "lin", 0.001, 0.08, "s", 0.001 / 0.495),
+    function(x) queue_engine_call(param_id(prefix, "wsola_window"), "wsolaWindow", x) end,
+    format_ms)
+
+  add_control(param_id(prefix, "wsola_search"), "OLA wander",
+    cs.new(0, 0.1, "lin", 0.001, 0.015, "s", 0.001 / 0.1),
+    function(x) queue_engine_call(param_id(prefix, "wsola_search"), "wsolaSearch", x) end,
+    format_ms)
+
+  add_control(param_id(prefix, "pv_window"), "PC window",
+    cs.new(0.005, 2, "lin", 0.001, 0.2, "", 0.001 / 1.995),
+    function(x) queue_engine_call(param_id(prefix, "pv_window"), "pvWindow", x) end,
+    format_ms)
+
+  add_control(param_id(prefix, "pv_dispersion"), "PC dispersion",
+    cs.new(0, 1, "lin", 0.001, 0, "", 0.001),
+    function(x) queue_engine_call(param_id(prefix, "pv_dispersion"), "pvDispersion", x) end)
+
+  params:add_group(param_id(prefix, "group_slices"), "slice machines", 11)
+
+  add_control(param_id(prefix, "slice_count"), "slice count",
+    cs.new(1, 32, "lin", 1, 16, "", 1 / 31),
+    function(_) end,
+    function(param) return tostring(math.floor(param:get() + 0.5)) end)
+
+  add_control(param_id(prefix, "slice_index"), "slice index",
+    cs.new(1, 32, "lin", 1, 1, "", 1 / 31),
+    function(_) end,
+    function(param) return tostring(math.floor(param:get() + 0.5)) end)
+
+  params:add_option(param_id(prefix, "slice_play_mode"), "slice play mode", {"1 shot", "1 shot hold", "loop", "continue"}, 1)
+  params:set_action(param_id(prefix, "slice_play_mode"), function(_) end)
+
+  params:add_binary(param_id(prefix, "slice_reverse"), "slice reverse", "toggle", 0)
+  params:set_action(param_id(prefix, "slice_reverse"), function(_) end)
+
+  params:add_binary(param_id(prefix, "slice_sync"), "slice clock sync", "toggle", 1)
+  params:set_action(param_id(prefix, "slice_sync"), function(x)
+    queue_engine_call(param_id(prefix, "slice_sync"), "setSliceSyncToClock", x)
+  end)
+
+  add_control(param_id(prefix, "slice_rate"), "slice rate",
+    cs.new(0.125, 8, "exp", 0.01, 1, "x", 0.01),
+    function(x) queue_engine_call(param_id(prefix, "slice_rate"), "setSliceRate", x) end,
+    function(param) return string.format("%.2fx", param:get()) end)
+
+  params:add_option(param_id(prefix, "slice_polyphony"), "slice polyphony", {"poly 8", "mono"}, 1)
+  params:set_action(param_id(prefix, "slice_polyphony"), function(x)
+    engine_call("setSliceMono", x == 2 and 1 or 0)
+  end)
+
+  params:add_binary(param_id(prefix, "slice_hold_to_step"), "slice hold to step", "toggle", 1)
+  params:set_action(param_id(prefix, "slice_hold_to_step"), function(_) end)
+
+  add_control(param_id(prefix, "slice_attack"), "slice attack",
+    cs.new(0.0001, 0.2, "lin", 0.0001, 0.002, "", 0.0005 / 0.1999),
+    function(x) queue_engine_call(param_id(prefix, "slice_attack"), "sliceAttack", x) end,
+    format_ms)
+
+  add_control(param_id(prefix, "slice_hold"), "slice hold",
+    cs.new(0, 4, "lin", 0.01, 0.25, "", 0.01 / 4),
+    function(_) end,
+    format_ms)
+
+  add_control(param_id(prefix, "slice_release"), "slice release",
+    cs.new(0.0001, 0.5, "lin", 0.0001, 0.02, "", 0.001 / 0.4999),
+    function(x) queue_engine_call(param_id(prefix, "slice_release"), "sliceRelease", x) end,
+    format_ms)
+
+  params:add_group(param_id(prefix, "group_razor"), "razor slices", 65)
+
+  params:add_trigger(param_id(prefix, "razor_reset"), "reset razor slices")
+  params:set_action(param_id(prefix, "razor_reset"), function()
+    for i = 1, 32 do
+      local start_id = param_id(prefix, string.format("razor_%02d_start", i))
+      local end_id = param_id(prefix, string.format("razor_%02d_end", i))
+      local start_point = (i - 1) * 4
+      local end_point = i * 4
+      razor_start_values[i] = start_point
+      params:set(start_id, start_point, true)
+      params:set(end_id, end_point, true)
+    end
+  end)
+
+  for i = 1, 32 do
+    local start_id = param_id(prefix, string.format("razor_%02d_start", i))
+    local end_id = param_id(prefix, string.format("razor_%02d_end", i))
+    local default_start = (i - 1) * 4
+    local default_end = i * 4
+    razor_start_values[i] = default_start
+
+    add_control(start_id, string.format("razor %02d start", i),
+      cs.new(0, 128, "lin", 0.01, default_start, "", 1 / 128),
+      function(x)
+        if razor_adjusting then
+          razor_start_values[i] = x
+          return
+        end
+        local previous = razor_start_values[i] or default_start
+        local delta = x - previous
+        razor_start_values[i] = x
+        if math.abs(delta) > 0 then
+          local current_end = params:get(end_id)
+          local next_end = util.clamp(current_end + delta, 0, 128)
+          if next_end <= x then
+            next_end = util.clamp(x + 0.01, 0.01, 128)
+          end
+          razor_adjusting = true
+          params:set(end_id, next_end)
+          razor_adjusting = false
+        end
+      end)
+
+    add_control(end_id, string.format("razor %02d end", i),
+      cs.new(0, 128, "lin", 0.01, default_end, "", 1 / 128),
+      function(x)
+        if razor_adjusting then
+          return
+        end
+        local current_start = params:get(start_id)
+        if x <= current_start then
+          razor_adjusting = true
+          params:set(end_id, util.clamp(current_start + 0.01, 0.01, 128))
+          razor_adjusting = false
+        end
+      end)
+  end
+
+  params:add_group(param_id(prefix, "group_system"), "system", 2)
+
+  params:add_trigger(param_id(prefix, "reset"), "reset")
+  params:set_action(param_id(prefix, "reset"), function() engine_call("reset") end)
+
+  params:add_option(ids.debug, "debug", {"errors", "lifecycle", "clock", "verbose"}, 2)
+  params:set_action(ids.debug, function(x) engine_call("setDebug", x - 1) end)
+
+  if default_sync == 1 then
+    send_clock_observation()
+    elasticat.start_clock_sync()
+  end
+end
+
+return elasticat

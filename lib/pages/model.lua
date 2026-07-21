@@ -1,0 +1,145 @@
+local ParamItem = include("lib/ui/param_item")
+local item = ParamItem.item
+
+local page_model = {
+  master = {
+    title = "MASTER",
+    pages = {
+      {
+        title = "MASTER",
+        items = {
+          item("target_bpm", "BPM", {lockable = false, min = 20, max = 300, step = 1, snaps = {60, 80, 90, 100, 110, 120, 128, 136, 140, 160, 180}}),
+          item("amp", "VOL", {lockable = true, min = 0, max = 2, step = 0.01, snaps = {0, 0.25, 0.5, 0.75, 0.8, 1, 1.25, 1.5, 2}})
+        }
+      }
+    },
+    settings = {
+      item("clock_sync", "SYNC", {binary = true, min = 0, max = 1, step = 1}),
+      item("live_performance_mode", "LPRF", {binary = true, min = 0, max = 1, step = 1}),
+      item("step_preview", "PREV", {binary = true, min = 0, max = 1, step = 1}),
+      item("debug", "DBG", {options = 4})
+    }
+  },
+  pattern = {
+    title = "PATTERN",
+    pages = {
+      {
+        title = "PATTERN",
+        items = {
+          item("pattern_steps", "LEN", {lockable = false, min = 1, max = 256, step = 1, snaps = {4, 8, 16, 32, 48, 64, 96, 128, 256}}),
+          item("pattern_rate", "RATE", {pseudo = "pattern_rate", lockable = false, min = 1, max = 8, step = 1, options = 8})
+        }
+      }
+    },
+    settings = {
+      item("pattern_rate", "RATE", {pseudo = "pattern_rate", options = 8})
+    }
+  },
+  trig = {
+    title = "TRIG",
+    pages = {
+      {
+        title = "TRIG",
+        items = {
+          item("pitch", "NOTE", {lockable = true, min = -24, max = 24, step = 0.1, snaps = {-24, -12, -7, 0, 7, 12, 24}}),
+          item("default_length", "LEN", {lock_id = "length", lockable = true, min = 0.25, max = 16, step = 0.25, snaps = {0.25, 0.5, 1, 2, 4, 8, 16}}),
+          item("default_velocity", "VEL", {lock_id = "velocity", lockable = true, min = 0, max = 1, step = 0.01, snaps = {0, 0.25, 0.5, 0.75, 1}})
+        }
+      }
+    },
+    settings = {}
+  },
+  source = {
+    title = "SOURCE",
+    pages = {
+      {
+        title = "SOURCE",
+        items = {
+          item("sample_slot", "SLOT", {lockable = true, min = 1, max = 128, step = 1, snaps = {1, 2, 4, 8, 16, 32, 64, 128}}),
+          item("loop_start", "STRT", {lockable = true, min = 0, max = 128, step = 1, fine_step = 0.01, snaps = {0, 8, 16, 32, 64, 96, 120, 128}}),
+          item("loop_end", "END", {lockable = true, min = 0, max = 128, step = 1, fine_step = 0.01, snaps = {0, 8, 16, 32, 64, 96, 120, 128}}),
+          item("loop_reverse", "LREV", {lockable = true, binary = true, min = 0, max = 1, step = 1}),
+          item("slice_reverse", "SREV", {lockable = true, binary = true, min = 0, max = 1, step = 1})
+        }
+      },
+      {
+        title = "WARP",
+        items = {
+          item("mode_macro", "MACR", {lockable = true, min = 0, max = 1, step = 0.001, snaps = {0, 0.25, 0.5, 0.75, 1}}),
+          item("chop_steps", "CHOP", {lockable = true, min = 0.25, max = 16, step = 0.25, snaps = {0.25, 0.5, 1, 2, 4, 8, 16}}),
+          item("chop_loop_mode", "LOOP", {lockable = true, options = 3}),
+          item("grain_size", "GSIZ", {lockable = true, min = 0.002, max = 0.5, step = 0.001, snaps = {0.005, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32}}),
+          item("grain_density", "GDEN", {lockable = true, min = 1, max = 64, step = 1, snaps = {1, 2, 4, 8, 16, 32, 64}}),
+          item("grain_jitter", "GJIT", {lockable = true, min = 0, max = 0.25, step = 0.001, snaps = {0, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25}}),
+          item("wsola_window", "OWIN", {lockable = true, min = 0.005, max = 0.5, step = 0.001, snaps = {0.005, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32}}),
+          item("wsola_search", "OWAN", {lockable = true, min = 0, max = 0.1, step = 0.001, snaps = {0, 0.005, 0.01, 0.02, 0.05, 0.1}})
+        }
+      },
+      {
+        title = "SAMPLE",
+        items = {
+          item("sample_slot", "SLOT", {lockable = false, min = 1, max = 128, step = 1, snaps = {1, 2, 4, 8, 16, 32, 64, 128}}),
+          item("sample", "FILE", {file = true, lockable = false}),
+          item("sample_bpm", "BPM", {lockable = false, min = 20, max = 300, step = 1, snaps = {60, 80, 90, 100, 110, 120, 128, 136, 140, 160, 180}}),
+          item("sample_steps", "STEP", {lockable = false, min = 1, max = 512, step = 1, snaps = {4, 8, 16, 32, 48, 64, 96, 128, 256, 512}}),
+          item("trim_start", "TST", {lockable = false, min = 0, max = 3600, step = 0.01, fine_step = 0.001}),
+          item("trim_end", "TEN", {lockable = false, min = 0, max = 3600, step = 0.01, fine_step = 0.001}),
+          item("gain", "GAIN", {lockable = false, min = 0, max = 4, step = 0.01, snaps = {0, 0.5, 1, 1.5, 2, 3, 4}})
+        }
+      },
+      {
+        title = "MACHINE",
+        items = {}
+      }
+    },
+    settings = {
+      item("machine", "MACH", {options = 4}),
+      item("mode", "WARP", {options = 6}),
+      item("loop_division", "LDIV", {lockable = false, min = 2, max = 32, step = 2, snaps = {2, 4, 8, 16, 32}}),
+      item("trig_polyphony", "POLY", {options = 2}),
+      item("playhead_return", "PHED", {options = 3})
+    }
+  },
+  filter = {
+    title = "FILTER",
+    pages = {
+      {title = "FILTER", items = {}}
+    },
+    settings = {}
+  },
+  amp = {
+    title = "AMP",
+    pages = {
+      {
+        title = "AMP",
+        items = {
+          item("amp", "VOL", {lockable = true, min = 0, max = 2, step = 0.01, snaps = {0, 0.25, 0.5, 0.75, 0.8, 1, 1.25, 1.5, 2}}),
+          item("slice_attack", "ATK", {lockable = true, min = 0.0001, max = 0.2, step = 0.0005, snaps = {0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2}}),
+          item("slice_hold", "HOLD", {lockable = true, min = 0, max = 4, step = 0.01, snaps = {0, 0.05, 0.1, 0.25, 0.5, 1, 2, 4}}),
+          item("slice_release", "REL", {lockable = true, min = 0.0001, max = 0.5, step = 0.001, snaps = {0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5}}),
+          item("xfade", "XFAD", {lockable = true, min = 0, max = 0.25, step = 0.001, snaps = {0, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25}})
+        }
+      }
+    },
+    settings = {
+      item("slice_hold_to_step", "HOLD", {binary = true, min = 0, max = 1, step = 1}),
+      item("slice_polyphony", "POLY", {options = 2})
+    }
+  },
+  fx = {
+    title = "FX",
+    pages = {
+      {title = "FX", items = {}}
+    },
+    settings = {}
+  },
+  mod = {
+    title = "MOD",
+    pages = {
+      {title = "MOD", items = {}}
+    },
+    settings = {}
+  }
+}
+
+return page_model
