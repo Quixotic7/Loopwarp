@@ -392,7 +392,9 @@ local function sync_sample_file_param(path)
 end
 
 local function set_active_pool_slot(slot)
-  slot = sample_slot_number(slot)
+  -- Slot 0 = Off: a deliberate silence slot (no sample loadable). The engine
+  -- plays its zeroed buffers so audio stops while the transport keeps running.
+  slot = util.clamp(math.floor((tonumber(slot) or 1) + 0.5), 0, 128)
   if slot ~= active_sample_slot then
     elasticat.flush_dirty_pool_state()
   end
@@ -402,6 +404,15 @@ local function set_active_pool_slot(slot)
     if math.floor((params:get(ids.sample_slot) or 1) + 0.5) ~= slot then
       params:set(ids.sample_slot, slot, true)
     end
+  end
+
+  if slot == 0 then
+    sync_sample_file_param(nil)
+    engine_call("setSampleSlot", 0)
+    if not suppress_pool_callback and pool_options.on_sample_slot ~= nil then
+      pool_options.on_sample_slot(0, nil)
+    end
+    return
   end
 
   sync_sample_file_param(sample_pool.paths[slot])
@@ -439,6 +450,19 @@ local function queue_engine_call(key, name, ...)
   queue_engine_send(key, function()
     engine_call(name, unpack(args))
   end)
+end
+
+-- Coalesced (12Hz) version of update_engine_loop_points -- used when re-mapping
+-- the loop points from a rapidly-scrubbed control (Range) during playback, so
+-- per-detent edits don't flood the engine with immediate sends and feel laggy.
+local function queue_engine_loop_points()
+  if ids.loop_start == nil or ids.loop_end == nil then
+    return
+  end
+  local start_point = params:lookup_param(ids.loop_start) ~= nil and params:get(ids.loop_start) or 0
+  local end_point = params:lookup_param(ids.loop_end) ~= nil and params:get(ids.loop_end) or 128
+  queue_engine_call(ids.loop_start, "loopStart", map_trim_point(start_point))
+  queue_engine_call(ids.loop_end, "loopEnd", map_trim_point(end_point))
 end
 
 -- The engine only has one gain input (setAmp); the per-sample "gain" param
@@ -652,7 +676,11 @@ function elasticat.active_pool_slot()
 end
 
 function elasticat.pool_path(slot)
-  return sample_pool.paths[sample_slot_number(slot or active_sample_slot)]
+  slot = slot or active_sample_slot
+  if slot == 0 then
+    return nil
+  end
+  return sample_pool.paths[sample_slot_number(slot)]
 end
 
 function elasticat.pool_label(slot)
@@ -664,7 +692,11 @@ function elasticat.pool_label(slot)
 end
 
 function elasticat.pool_meta(slot)
-  slot = sample_slot_number(slot or active_sample_slot)
+  slot = slot or active_sample_slot
+  if slot == 0 then
+    return { duration = 0, gain = 1 }
+  end
+  slot = sample_slot_number(slot)
   return {
     path = sample_pool.paths[slot],
     samples = sample_pool.samples[slot],
@@ -700,6 +732,10 @@ function elasticat.set_pool_slot(slot)
 end
 
 function elasticat.load_pool_slot(slot, path, make_active)
+  if math.floor((tonumber(slot) or 1) + 0.5) < 1 then
+    print("elasticat: slot 0 is Off; cannot load a sample there")
+    return false
+  end
   slot = sample_slot_number(slot)
   print("elasticat: pool slot " .. tostring(slot) .. " load " .. tostring(path))
   if path == nil or path == "-" or path == "" or path:sub(-1) == "/" or not is_audio_file(path) then
@@ -843,11 +879,14 @@ function elasticat.params(options)
   params:add_group(param_id(prefix, "group_setup"), "elasticat setup", 18)
 
   add_control(ids.sample_slot, "sample slot",
-    cs.new(1, 128, "lin", 1, 1, "", 1 / 127),
+    cs.new(0, 128, "lin", 1, 1, "", 1 / 128),
     function(x)
       set_active_pool_slot(x)
     end,
-    function(param) return tostring(math.floor(param:get() + 0.5)) end)
+    function(param)
+      local v = math.floor(param:get() + 0.5)
+      return v < 1 and "off" or tostring(v)
+    end)
 
   params:add_file(ids.sample, "sample", options.sample or _path.audio)
   params:set_action(ids.sample, function(path)
@@ -1078,7 +1117,7 @@ function elasticat.params(options)
           last_range_start = x
         end
       end
-      update_engine_loop_points()
+      queue_engine_loop_points()
     end)
 
   add_control(ids.range_end, "range end",
@@ -1089,7 +1128,7 @@ function elasticat.params(options)
       if x < min_end then
         params:set(ids.range_end, min_end, true)
       end
-      update_engine_loop_points()
+      queue_engine_loop_points()
     end)
 
   -- E-SNC: when on, range end tracks range start (see range_start action and the

@@ -98,7 +98,7 @@ end
 
 function SourcePage:draw_sample_slot_tab(param_item, x, y, inverted)
   local slot = math.floor((self.param_values:item_raw_value(param_item) or 1) + 0.5)
-  local text = tostring(slot)
+  local text = slot < 1 and "off" or tostring(slot)
   local fg = inverted and 0 or 15
   local bg = inverted and 15 or 0
 

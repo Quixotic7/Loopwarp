@@ -1009,14 +1009,36 @@ Engine_Elasticat : CroneEngine {
 
 	setSampleSlot { arg slot;
 		var idx;
-		slot = slot.asInteger.clip(1, poolSize);
+		slot = slot.asInteger;
+
+		// Slot 0 (Off): a deliberate silence slot -- point the reader at the
+		// default (zeroed) buffers so it outputs silence while the transport
+		// keeps running. Useful for sequencing gaps.
+		if(slot < 1, {
+			sampleSlot = 0;
+			this.releaseAllSlices;
+			loaded = 0;
+			bufL = defaultBufL;
+			bufR = defaultBufR;
+			this.setActive(\bufL, bufL.bufnum);
+			this.setActive(\bufR, bufR.bufnum);
+			scriptAddress.sendBundle(0, ["/elasticat/pool/slot/active", 0, 0, 0, ""]);
+			^nil;
+		});
+
+		slot = slot.clip(1, poolSize);
 		idx = slot - 1;
 		sampleSlot = slot;
 
 		if(poolLoaded[idx] != 1, {
+			// Empty slot -> silence too (was: keep the previous buffer, so the
+			// last-loaded sample kept playing).
 			this.releaseAllSlices;
 			loaded = 0;
-			this.setActive(\playing, 0);
+			bufL = defaultBufL;
+			bufR = defaultBufR;
+			this.setActive(\bufL, bufL.bufnum);
+			this.setActive(\bufR, bufR.bufnum);
 			scriptAddress.sendBundle(0, ["/elasticat/pool/slot/missing", sampleSlot]);
 			^nil;
 		});
