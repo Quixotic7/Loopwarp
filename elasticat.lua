@@ -313,7 +313,14 @@ end
 local function loop_phase_rate(start_point, end_point)
   start_point = start_point or params:get(id("loop_start")) or 0
   end_point = end_point or params:get(id("loop_end")) or 128
-  local region = math.max(0.01, end_point - start_point) / 128
+  -- Rate must reflect the region *as played* -- range + trim mapped -- not the
+  -- Track width, or a narrowed range makes the playhead crawl (looks like it
+  -- doesn't match the audio).
+  local eng_start, eng_end = start_point, end_point
+  if elasticat.map_region ~= nil then
+    eng_start, eng_end = elasticat.map_region(start_point, end_point)
+  end
+  local region = math.max(0.01, eng_end - eng_start) / 128
   local steps = math.max(1, params:get(id("sample_steps")) or 16)
   local loop_beats = math.max(0.03125, (steps / 4) * region)
 
@@ -326,6 +333,15 @@ local function loop_phase_rate(start_point, end_point)
   return (params:get(id("target_bpm")) or 120) / 60 / loop_beats
 end
 
+-- +1 forward, -1 when loop reverse is on, so the visual playhead travels the
+-- same direction as the audio.
+local function playhead_direction()
+  if params:lookup_param(id("loop_reverse")) ~= nil and params:get(id("loop_reverse")) == 1 then
+    return -1
+  end
+  return 1
+end
+
 local function display_phase()
   local phase = status.phase or 0
   local previewing = grid_ui ~= nil and grid_ui.preview_active == true
@@ -335,12 +351,12 @@ local function display_phase()
 
   local elapsed = util.time() - (status.phase_time or util.time())
   local start_point, end_point = active_region()
-  return (phase + (elapsed * loop_phase_rate(start_point, end_point))) % 1
+  return (phase + (playhead_direction() * elapsed * loop_phase_rate(start_point, end_point))) % 1
 end
 
 local function position_at_region(start_point, end_point, at_time)
   local elapsed = (at_time or util.time()) - (status.phase_time or util.time())
-  local unwrapped = (status.phase or 0) + (elapsed * loop_phase_rate(start_point, end_point))
+  local unwrapped = (status.phase or 0) + (playhead_direction() * elapsed * loop_phase_rate(start_point, end_point))
   local nearest = math.floor(unwrapped + 0.5)
   local phase
   if nearest == 1 and math.abs(unwrapped - nearest) < 0.01 then
@@ -388,6 +404,8 @@ local source_page = SourcePage.new({
   draw_page_header = draw_page_header,
   active_waveform = active_waveform,
   active_region = active_region,
+  active_range = function() return elasticat.active_range() end,
+  get_playing = function() return playing end,
   display_phase = display_phase,
   visual_param_value = visual_param_value,
   id = id,

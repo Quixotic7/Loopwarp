@@ -487,7 +487,34 @@ function GridSequencer:set_held_param_lock(param_id, value)
       did_lock = true
     end
   end
+  if did_lock then
+    -- If we're previewing a held step while stopped, re-apply its range/region/
+    -- pitch live so edits (e.g. range start/end) are heard immediately without
+    -- re-pressing the step.
+    self:refresh_preview_region()
+  end
   return did_lock
+end
+
+-- Re-apply the currently-previewed step's range, region and pitch so lock edits
+-- take effect live during a stopped step preview.
+function GridSequencer:refresh_preview_region()
+  if self.playing or not self.preview_active then
+    return
+  end
+  local index = self:held_step_index()
+  if index == nil then
+    return
+  end
+  local record = self:step_record(index, false)
+  if record == nil or record.trig ~= true then
+    return
+  end
+  local locks = record.param_locks or {}
+  self:push_active_range(locks.range_start, locks.range_end)
+  local start_point, end_point = self:locked_region(record)
+  self:set_region(start_point, end_point)
+  self:apply_step_pitch(record)
 end
 
 function GridSequencer:held_param_lock(param_id)

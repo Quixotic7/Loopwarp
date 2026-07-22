@@ -28,6 +28,8 @@ function SourcePage.new(opts)
     draw_page_header = opts.draw_page_header,
     active_waveform = opts.active_waveform,
     active_region = opts.active_region,
+    active_range = opts.active_range,
+    get_playing = opts.get_playing,
     display_phase = opts.display_phase,
     visual_param_value = opts.visual_param_value,
     id = opts.id,
@@ -219,16 +221,31 @@ function SourcePage:draw_waveform(opts)
   end
 
   -- Range (0-128) nested inside the trim window, expressed as fractions of the
-  -- whole sample. The three sample pages are nested views: File shows [0,1] and
-  -- edits trim; Range shows [trim_lo,trim_hi] and edits range; Main shows the
-  -- range window and edits Track start/end.
-  local range_start_val = util.clamp(self.visual_param_value("range_start", 0), 0, 128)
-  local range_end_val = util.clamp(self.visual_param_value("range_end", 128), 0, 128)
+  -- whole sample. Two distinct ranges:
+  --   marker range -- the Track (or held-step) values the range markers draw.
+  --     Stable so they stay editable during playback (they don't sweep).
+  --   actual range -- what's actually playing (Step Range sweeps included). Used
+  --     for the Main-page view window and for shading the waveform bright/dim.
   local trim_span = trim_hi - trim_lo
-  local range_lo = util.clamp(trim_lo + (trim_span * (range_start_val / 128)), 0, 1)
-  local range_hi = util.clamp(trim_lo + (trim_span * (range_end_val / 128)), 0, 1)
-  if range_hi <= range_lo then
-    range_hi = math.min(1, range_lo + 0.001)
+  local function range_to_frac(v)
+    return util.clamp(trim_lo + (trim_span * (util.clamp(v, 0, 128) / 128)), 0, 1)
+  end
+
+  local marker_range_lo = range_to_frac(self.visual_param_value("range_start", 0))
+  local marker_range_hi = range_to_frac(self.visual_param_value("range_end", 128))
+  if marker_range_hi <= marker_range_lo then
+    marker_range_hi = math.min(1, marker_range_lo + 0.001)
+  end
+
+  local actual_range_start, actual_range_end =
+    self.visual_param_value("range_start", 0), self.visual_param_value("range_end", 128)
+  if self.get_playing ~= nil and self.get_playing() and self.active_range ~= nil then
+    actual_range_start, actual_range_end = self.active_range()
+  end
+  local active_lo = range_to_frac(actual_range_start)
+  local active_hi = range_to_frac(actual_range_end)
+  if active_hi <= active_lo then
+    active_hi = math.min(1, active_lo + 0.001)
   end
 
   local view_lo, view_hi
@@ -237,7 +254,9 @@ function SourcePage:draw_waveform(opts)
   elseif opts.range_edit then
     view_lo, view_hi = trim_lo, trim_hi
   else
-    view_lo, view_hi = range_lo, range_hi
+    -- Main view follows the Actual Range so the shown slice re-renders with a
+    -- sequenced sweep.
+    view_lo, view_hi = active_lo, active_hi
   end
 
   -- FN zoom is the Sample (file trim) page only. The Range page does not zoom
@@ -268,7 +287,11 @@ function SourcePage:draw_waveform(opts)
   end
 
   local gain = meta.gain or 1
-  screen.level(6)
+  -- Bright where the Actual Range is playing, dim elsewhere. screen.level is set
+  -- only when the shade actually changes (at the range boundaries), NOT once per
+  -- column -- 127 screen.level calls per frame floods the norns screen command
+  -- buffer and stalls the redraw metro (froze screen+grid together previously).
+  local current_level = nil
   for column = 0, width - 1 do
     local fraction = view_lo + ((view_hi - view_lo) * (column / math.max(1, width - 1)))
     local index = math.floor(fraction * (#waveform - 1)) + 1
@@ -276,6 +299,11 @@ function SourcePage:draw_waveform(opts)
     local amp = math.max(1, math.floor((height / 2) * peak))
     local top = util.clamp(center - amp, y0, y0 + height - 1)
     local bottom = util.clamp(center + amp, y0, y0 + height - 1)
+    local level = (fraction >= active_lo and fraction <= active_hi) and 6 or 2
+    if level ~= current_level then
+      screen.level(level)
+      current_level = level
+    end
     screen.rect(x0 + column, top, 1, bottom - top + 1)
     screen.fill()
   end
@@ -313,7 +341,7 @@ function SourcePage:draw_waveform(opts)
     end
   elseif opts.range_edit then
     screen.level(9)
-    self:draw_marker_pair(range_lo, range_hi, view_lo, view_hi, x0, y0, width, height)
+    self:draw_marker_pair(marker_range_lo, marker_range_hi, view_lo, view_hi, x0, y0, width, height)
   else
     screen.level(9)
     self:draw_waveform_marker(visual_start, x0, y0, width, height, "start")

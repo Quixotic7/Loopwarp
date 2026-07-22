@@ -190,6 +190,21 @@ function elasticat.set_active_range(range_start, range_end)
   active_range_end = range_end
 end
 
+-- The Actual Range (0-128) actually driving playback: Step Range override when
+-- set, else the Track Range params. Used by the waveform view so it can follow
+-- a sequenced range sweep during playback.
+function elasticat.active_range()
+  local rs = active_range_start
+  local re = active_range_end
+  if rs == nil and ids.range_start ~= nil and params:lookup_param(ids.range_start) ~= nil then
+    rs = params:get(ids.range_start)
+  end
+  if re == nil and ids.range_end ~= nil and params:lookup_param(ids.range_end) ~= nil then
+    re = params:get(ids.range_end)
+  end
+  return rs or 0, re or 128
+end
+
 -- Range Start/End (0-128) carve a live performance window *inside* the file
 -- trim window: 0 = trim start, 128 = trim end. Unlike file trim (saved per
 -- sample) this is a global, p-lockable layer. Returns the window in seconds.
@@ -225,6 +240,14 @@ local function map_trim_point(point, slot)
   local range_lo, range_hi = range_bounds(trim_start, trim_end)
   local fraction = util.clamp(point or 0, 0, 128) / 128
   return ((range_lo + ((range_hi - range_lo) * fraction)) / duration) * 128
+end
+
+-- Maps a Track-space region (0-128) to the engine-space region actually played
+-- (range + trim folded in). The visual playhead needs this so its rate matches
+-- the true loop length -- e.g. a narrowed range loops far faster than the Track
+-- width alone implies.
+function elasticat.map_region(track_start, track_end)
+  return map_trim_point(track_start), map_trim_point(track_end)
 end
 
 local function update_engine_loop_points()
@@ -1070,8 +1093,10 @@ function elasticat.params(options)
     end)
 
   -- E-SNC: when on, range end tracks range start (see range_start action and the
-  -- grid p-lock auto-lock in param_values). Pure UI behavior, no engine action.
-  params:add_binary(ids.range_end_sync, "range end sync", "toggle", 1)
+  -- grid p-lock auto-lock in param_values). Default off -- a new user could be
+  -- confused that start won't move independently until end is adjusted. Pure UI
+  -- behavior, no engine action.
+  params:add_binary(ids.range_end_sync, "range end sync", "toggle", 0)
 
   -- Sample preview: momentary audition of the current sample's trim window,
   -- only while master playback is stopped (see elasticat.preview_trim). Driven
