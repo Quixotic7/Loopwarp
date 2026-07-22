@@ -369,12 +369,19 @@ end
 
 local function draw_page_header(title, page_number)
   local grid_status = nil
-  if grid_ui ~= nil and grid_ui.screen_status ~= nil then
-    grid_status = grid_ui:screen_status()
+  local ghost = false
+  if grid_ui ~= nil then
+    if grid_ui.screen_status ~= nil then
+      grid_status = grid_ui:screen_status()
+    end
+    if grid_ui.held_step_is_ghost ~= nil then
+      ghost = grid_ui:held_step_is_ghost()
+    end
   end
 
   Header.draw({
     track = 1,
+    ghost = ghost,
     message = visible_message() or grid_status or title or "ELASTICAT",
     tempo = param_value_or("target_bpm", 120),
     amp_l = status.amp_l,
@@ -675,6 +682,9 @@ function init()
     end,
     set_active_range = function(range_start, range_end)
       elasticat.set_active_range(range_start, range_end)
+    end,
+    reset_default = function(reset_id)
+      return params:lookup_param(id(reset_id)) ~= nil and params:get(id(reset_id)) == 1
     end,
     get_slice_count = function()
       return params:get(id("slice_count"))

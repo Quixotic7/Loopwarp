@@ -413,7 +413,8 @@ function ParamValues:apply_param_lock_value(lock_id, value)
   -- steps trigger. length/velocity are consumed at trigger time, not as params.
   if lock_id == "length" or lock_id == "velocity"
     or lock_id == "loop_start" or lock_id == "loop_end"
-    or lock_id == "range_start" or lock_id == "range_end" then
+    or lock_id == "range_start" or lock_id == "range_end"
+    or lock_id == "env_reset" or lock_id == "lfo_reset" or lock_id == "filter_reset" then
     return
   end
   local full_id = self.id(lock_id)

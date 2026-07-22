@@ -415,6 +415,37 @@ function GridSequencer:lock_held_steps(start_point, end_point, held_count)
   return did_lock
 end
 
+-- A reset flag is active for a step when the step p-locks it on, or (no lock)
+-- the track default is on. Env/LFO/Filter resets are placeholders for now.
+function GridSequencer:reset_active(record, reset_id)
+  local locks = record ~= nil and record.param_locks or nil
+  if locks ~= nil and locks[reset_id] ~= nil then
+    return locks[reset_id] == 1
+  end
+  if self.options.reset_default ~= nil then
+    return self.options.reset_default(reset_id) == true
+  end
+  return true
+end
+
+-- Ghost triggers are derived (not a stored flag): a trig that resets nothing --
+-- no start reset (loop_start lock) and env/LFO/filter resets all off. So a step
+-- becomes ghost by clearing its start lock and turning its resets off, and back
+-- to normal by restoring either. Ghosts carry the current state forward instead
+-- of ending the previous note.
+function GridSequencer:is_ghost(record)
+  if record == nil or record.trig ~= true then
+    return false
+  end
+  local locks = record.param_locks or {}
+  if locks.loop_start ~= nil then
+    return false
+  end
+  return not (self:reset_active(record, "env_reset")
+    or self:reset_active(record, "lfo_reset")
+    or self:reset_active(record, "filter_reset"))
+end
+
 function GridSequencer:toggle_step(page, step)
   local index = self:step_index(page, step)
   local record = self:step_record(index, false)
@@ -428,8 +459,35 @@ function GridSequencer:toggle_step(page, step)
   record.trig = true
   if is_slice_machine(self:machine()) then
     record.slices[self:slice_index()] = true
+  else
+    -- Loop machines: a normal trigger resets start to 0 (the non-ghost default).
+    record.param_locks = record.param_locks or {}
+    record.param_locks.loop_start = 0
   end
   self:message(string.format("Step %02d Trig", step))
+end
+
+-- FN + tap toggles a step between normal and ghost. Ghost = no start reset and
+-- env/LFO/filter resets off; normal = start reset (0) and resets on.
+function GridSequencer:toggle_ghost_step(page, step)
+  local index = self:step_index(page, step)
+  local record = self:step_record(index, true)
+  record.trig = true
+  record.param_locks = record.param_locks or {}
+  if self:is_ghost(record) then
+    record.param_locks.loop_start = 0
+    record.param_locks.env_reset = nil
+    record.param_locks.lfo_reset = nil
+    record.param_locks.filter_reset = nil
+    self:message(string.format("Step %02d Trig", step))
+  else
+    record.param_locks.loop_start = nil
+    record.param_locks.loop_end = nil
+    record.param_locks.env_reset = 0
+    record.param_locks.lfo_reset = 0
+    record.param_locks.filter_reset = 0
+    self:message(string.format("Step %02d Ghost", step))
+  end
 end
 
 function GridSequencer:toggle_step_slice(index, slice)
@@ -863,6 +921,15 @@ function GridSequencer:enter_step(reset_sequence)
   if reset_sequence then
     self:clear_param_lock_holds()
   end
+  -- Monophonic: a fresh non-ghost trigger ends the previous note -- clear the
+  -- carried holds so unlocked params revert to base before this step's locks
+  -- apply. Without this, a step's lock outlives its note-length window when the
+  -- length is >= 1 and the next trigger fails to switch it (e.g. sample slot).
+  -- Ghost triggers, and Poly mode, carry the previous state forward instead.
+  if not reset_sequence and record ~= nil and record.trig == true
+    and self:trig_polyphony() == 1 and not self:is_ghost(record) then
+    self:clear_param_lock_holds()
+  end
   if self.options.apply_step_param_locks ~= nil then
     self.options.apply_step_param_locks(self:effective_param_locks(record))
   end
@@ -1045,6 +1112,14 @@ function GridSequencer:screen_edit()
     locks = record ~= nil and table_count(record.param_locks) or 0,
     lock = self:step_lock(self.selected_page, step)
   }
+end
+
+function GridSequencer:held_step_is_ghost()
+  local index = self:held_step_index()
+  if index == nil then
+    return false
+  end
+  return self:is_ghost(self:step_record(index, false))
 end
 
 function GridSequencer:screen_status()
@@ -1333,7 +1408,7 @@ function GridSequencer:any_previewable_step_held()
   for step, held in pairs(self.step_holds) do
     if held then
       local record = self:step_record_for_page_step(self.selected_page, step, false)
-      if record ~= nil and record.trig == true then
+      if record ~= nil and record.trig == true and not self:is_ghost(record) then
         return true
       end
     end
@@ -1499,9 +1574,9 @@ function GridSequencer:key_step_row(x, z)
     end
     if not self.playing and self:step_preview_enabled() then
       local record = self:step_record(self:step_index(self.selected_page, x), false)
-      -- TODO(ghost triggers, task #23): once ghost steps exist, skip preview
-      -- for record.ghost the same way sequenced playback will.
-      if record ~= nil and record.trig == true then
+      -- Ghost steps reset nothing (no start, no region), so there is nothing to
+      -- preview -- skip them, same as sequenced playback carries through them.
+      if record ~= nil and record.trig == true and not self:is_ghost(record) then
         -- Apply the step's Step Range before setting the region so the preview
         -- plays the step's range window, not the whole trim.
         local locks = record.param_locks or {}
@@ -1521,7 +1596,11 @@ function GridSequencer:key_step_row(x, z)
     self.loop_tap_key = nil
     self.loop_tap_kind = nil
     if was_quick_press and not was_edited then
-      self:toggle_step(self.selected_page, x)
+      if self.fn_down then
+        self:toggle_ghost_step(self.selected_page, x)
+      else
+        self:toggle_step(self.selected_page, x)
+      end
     end
     if not any_keys(self.step_holds) and not any_keys(self.loop_holds) then
       if not self.playing then
@@ -1601,7 +1680,8 @@ function GridSequencer:draw_loop_row()
     end
   end
 
-  if (self.playing or self.preview_active) and self.options.phase ~= nil then
+  -- Playhead only while actually playing; a stopped preview would show it static.
+  if self.playing and self.options.phase ~= nil then
     local start_point, end_point = self:active_region()
     local phase = self.options.phase() or 0
     local position = start_point + ((end_point - start_point) * phase)
@@ -1719,6 +1799,11 @@ function GridSequencer:draw_step_row()
       level = record.trig and 7 or 5
       if record.pitch ~= nil then
         level = 9
+      end
+      if record.trig and self:is_ghost(record) then
+        -- Ghost: dimmer than a normal trig, slowly pulsing in/out over 2s.
+        local fade = (math.sin(util.time() * math.pi) + 1) / 2
+        level = 2 + math.floor((fade * 3) + 0.5)
       end
     end
     if self.playing and index == self.play_index then

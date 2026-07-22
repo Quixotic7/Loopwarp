@@ -12,6 +12,24 @@ local METER_MIN_DB = -48
 local METER_MAX_DB = 12
 local METER_BRIGHT_DB = -12
 
+-- Tiny ghost silhouette drawn where the track number normally sits, shown while
+-- holding a ghost step. Black body with background-colored eyes and feet.
+function Header.draw_ghost_icon(cx)
+  local x = cx - 2
+  local y = 1
+  screen.level(0)
+  screen.rect(x + 1, y, 3, 1)
+  screen.fill()
+  screen.rect(x, y + 1, 5, 5)
+  screen.fill()
+  screen.level(Header.BACKGROUND_LEVEL)
+  screen.pixel(x + 1, y + 5)
+  screen.pixel(x + 3, y + 5)
+  screen.pixel(x + 1, y + 2)
+  screen.pixel(x + 3, y + 2)
+  screen.fill()
+end
+
 local function db_to_length(db)
   local clamped = util.clamp(db, METER_MIN_DB, METER_MAX_DB)
   local fraction = (clamped - METER_MIN_DB) / (METER_MAX_DB - METER_MIN_DB)
@@ -91,9 +109,13 @@ function Header.draw(opts)
   screen.rect(Header.SEPARATOR_X, 0, 1, Header.HEIGHT)
   screen.fill()
 
-  screen.level(0)
-  screen.move(math.floor(Header.SEPARATOR_X / 2), 7)
-  screen.text_center(tostring(opts.track or 1))
+  if opts.ghost then
+    Header.draw_ghost_icon(math.floor(Header.SEPARATOR_X / 2))
+  else
+    screen.level(0)
+    screen.move(math.floor(Header.SEPARATOR_X / 2), 7)
+    screen.text_center(tostring(opts.track or 1))
+  end
 
   screen.move(Header.SEPARATOR_X + 2, 7)
   screen.text_trim(message, 76)

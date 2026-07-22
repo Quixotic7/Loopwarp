@@ -1,5 +1,6 @@
 local ParamItem = include("lib/ui/param_item")
 local item = ParamItem.item
+local blank = ParamItem.blank
 
 local page_model = {
   master = {
@@ -43,7 +44,11 @@ local page_model = {
         items = {
           item("pitch", "NOTE", {lockable = true, min = -24, max = 24, step = 0.1, snaps = {-24, -12, -7, 0, 7, 12, 24}}),
           item("default_length", "LEN", {lock_id = "length", lockable = true, min = 0.25, max = 16, step = 0.25, snaps = {0.25, 0.5, 1, 2, 4, 8, 16}}),
-          item("default_velocity", "VEL", {lock_id = "velocity", lockable = true, min = 0, max = 1, step = 0.01, snaps = {0, 0.25, 0.5, 0.75, 1}})
+          item("default_velocity", "VEL", {lock_id = "velocity", lockable = true, min = 0, max = 1, step = 0.01, snaps = {0, 0.25, 0.5, 0.75, 1}}),
+          blank(),
+          item("env_reset", "ERST", {lockable = true, binary = true, min = 0, max = 1, step = 1}),
+          item("lfo_reset", "LRST", {lockable = true, binary = true, min = 0, max = 1, step = 1}),
+          item("filter_reset", "FRST", {lockable = true, binary = true, min = 0, max = 1, step = 1})
         }
       }
     },

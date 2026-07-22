@@ -347,8 +347,12 @@ function SourcePage:draw_waveform(opts)
     self:draw_waveform_marker(visual_start, x0, y0, width, height, "start")
     self:draw_waveform_marker(visual_end, x0, y0, width, height, "end")
 
-    screen.level(15)
-    self:draw_waveform_marker(position, x0, y0, width, height, nil)
+    -- Only show the playhead while the transport is actually playing. While
+    -- stopped (incl. a held-step preview) it would sit static and misleading.
+    if self.get_playing == nil or self.get_playing() then
+      screen.level(15)
+      self:draw_waveform_marker(position, x0, y0, width, height, nil)
+    end
   end
 end
 

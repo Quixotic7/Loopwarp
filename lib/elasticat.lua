@@ -840,6 +840,9 @@ function elasticat.params(options)
   ids.pattern_steps = param_id(prefix, "pattern_steps")
   ids.default_length = param_id(prefix, "default_length")
   ids.default_velocity = param_id(prefix, "default_velocity")
+  ids.env_reset = param_id(prefix, "env_reset")
+  ids.lfo_reset = param_id(prefix, "lfo_reset")
+  ids.filter_reset = param_id(prefix, "filter_reset")
   ids.loop_start = param_id(prefix, "loop_start")
   ids.loop_end = param_id(prefix, "loop_end")
   ids.range_start = param_id(prefix, "range_start")
@@ -1063,6 +1066,14 @@ function elasticat.params(options)
     cs.new(0, 1, "lin", 0.01, 1, "", 0.01),
     function(_) end,
     function(param) return tostring(math.floor((param:get() * 100) + 0.5)) end)
+
+  -- Ghost-trigger reset flags (default on). A normal trigger resets envelope /
+  -- LFO / filter; a ghost trigger has these off. No engine action yet -- env /
+  -- LFO / filter don't exist until Phase 2/3, so these are forward-compatible
+  -- placeholders that also feed the ghost/normal derivation in grid_sequencer.
+  params:add_binary(ids.env_reset, "env reset", "toggle", 1)
+  params:add_binary(ids.lfo_reset, "lfo reset", "toggle", 1)
+  params:add_binary(ids.filter_reset, "filter reset", "toggle", 1)
 
   params:add_group(param_id(prefix, "group_loop"), "loop playback", 6)
 
