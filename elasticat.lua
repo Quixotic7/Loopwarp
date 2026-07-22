@@ -123,6 +123,12 @@ local function request_redraw()
   redraw_pending = true
 end
 
+-- "FN" is universal: either B1/K1 on norns (alt) or the FN key on the grid.
+-- Both drive the snap/zoom behaviors in param editing and the waveform view.
+local function fn_active()
+  return alt or (grid_ui ~= nil and grid_ui.fn_down == true)
+end
+
 local function set_visual_phase(phase)
   if phase ~= nil then
     status.phase = util.clamp(tonumber(phase) or status.phase, 0, 1)
@@ -186,13 +192,13 @@ local function page_items_for(category, page, page_index)
   if category == "source" and page_index == 1 then
     return source_sample_items()
   elseif category == "source" and page_index == 2 then
+    return source_machine_items()
+  elseif category == "source" and page_index == 3 then
     local machine_items = MachineRegistry.source_page2_items(param_value_or("machine", 1), ParamItem)
     if machine_items ~= nil then
       return machine_items
     end
     return source_warp_items()
-  elseif category == "source" and page_index == 4 then
-    return source_machine_items()
   end
   return page.items or {}
 end
@@ -202,6 +208,10 @@ nav = Navigation.new({
   show_message = show_message,
   request_redraw = request_redraw,
   on_navigate = function()
+    -- Leaving a page stops any sample preview in progress.
+    if params:lookup_param(id("sample_preview")) ~= nil and params:get(id("sample_preview")) == 1 then
+      params:set(id("sample_preview"), 0)
+    end
     if elasticat.flush_dirty_pool_state ~= nil then
       elasticat.flush_dirty_pool_state()
     end
@@ -214,13 +224,18 @@ param_values = ParamValues.new({
   sample_name = sample_name,
   param_value_or = param_value_or,
   get_grid_ui = function() return grid_ui end,
-  get_alt = function() return alt end,
+  get_alt = fn_active,
   get_select_sample = function() return select_sample end,
   get_default_trig_length = function() return default_trig_length end,
   set_default_trig_length = function(v) default_trig_length = v end,
   get_default_trig_velocity = function() return default_trig_velocity end,
   set_default_trig_velocity = function(v) default_trig_velocity = v end,
   set_last_trim_focus = function(v) last_trim_focus = v end,
+  get_sample_duration = function()
+    local slot = elasticat.active_pool_slot ~= nil and elasticat.active_pool_slot() or 1
+    local meta = elasticat.pool_meta ~= nil and elasticat.pool_meta(slot) or {}
+    return meta.duration or 0
+  end,
   active_step_lock_bases = active_step_lock_bases,
   active_step_lock_ids = active_step_lock_ids,
   value_flash_until = value_flash_until,
@@ -376,7 +391,7 @@ local source_page = SourcePage.new({
   display_phase = display_phase,
   visual_param_value = visual_param_value,
   id = id,
-  get_alt = function() return alt end,
+  get_alt = fn_active,
   get_last_trim_focus = function() return last_trim_focus end
 })
 
@@ -385,7 +400,12 @@ local function draw_root_page()
   local title = page.title or model.title or "ELASTICAT"
   local items = page_items_for(nav:current_category(), page, page_index)
 
-  if nav:current_category() == "source" and (page_index == 1 or page_index == 3) then
+  if nav:current_category() == "file" then
+    source_page:draw_file_page(page, items)
+    return
+  end
+
+  if nav:current_category() == "source" and (page_index == 1 or page_index == 4) then
     source_page:draw_sample_page(page, items)
     return
   end
@@ -450,6 +470,11 @@ end
 
 local function set_playing(state, reset_transport)
   reset_transport = reset_transport == true
+  -- Starting master transport cancels any File-page sample preview (silently --
+  -- the transport is about to drive the engine's play state itself).
+  if state and params:lookup_param(id("sample_preview")) ~= nil and params:get(id("sample_preview")) == 1 then
+    params:set(id("sample_preview"), 0, true)
+  end
   local frozen_phase = playing and display_phase() or status.phase
   if not state and loop_trig_gate_clock ~= nil then
     clock.cancel(loop_trig_gate_clock)
@@ -626,6 +651,12 @@ function init()
     end,
     play = function(state)
       elasticat.play(state)
+    end,
+    set_sample_preview = function(on)
+      params:set(id("sample_preview"), on and 1 or 0)
+    end,
+    set_active_range = function(range_start, range_end)
+      elasticat.set_active_range(range_start, range_end)
     end,
     get_slice_count = function()
       return params:get(id("slice_count"))

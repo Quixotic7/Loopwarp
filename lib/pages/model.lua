@@ -63,6 +63,10 @@ local page_model = {
         }
       },
       {
+        title = "MACHINE",
+        items = {}
+      },
+      {
         title = "WARP",
         items = {
           item("mode_macro", "MACR", {lockable = true, min = 0, max = 1, step = 0.001, snaps = {0, 0.25, 0.5, 0.75, 1}}),
@@ -76,20 +80,12 @@ local page_model = {
         }
       },
       {
-        title = "SAMPLE",
+        title = "RANGE",
         items = {
-          item("sample_slot", "SLOT", {lockable = false, min = 1, max = 128, step = 1, snaps = {1, 2, 4, 8, 16, 32, 64, 128}}),
-          item("sample", "FILE", {file = true, lockable = false}),
-          item("sample_bpm", "BPM", {lockable = false, min = 20, max = 300, step = 1, snaps = {60, 80, 90, 100, 110, 120, 128, 136, 140, 160, 180}}),
-          item("sample_steps", "STEP", {lockable = false, min = 1, max = 512, step = 1, snaps = {4, 8, 16, 32, 48, 64, 96, 128, 256, 512}}),
-          item("trim_start", "TST", {lockable = false, min = 0, max = 3600, step = 0.01, fine_step = 0.001}),
-          item("trim_end", "TEN", {lockable = false, min = 0, max = 3600, step = 0.01, fine_step = 0.001}),
-          item("gain", "GAIN", {lockable = false, min = 0, max = 4, step = 0.01, snaps = {0, 0.5, 1, 1.5, 2, 3, 4}})
+          item("range_start", "R-ST", {lockable = true, fn_snap_multiple = 8, min = 0, max = 128, step = 1}),
+          item("range_end", "R-EN", {lockable = true, fn_snap_multiple = 8, min = 0, max = 128, step = 1}),
+          item("range_end_sync", "E-SNC", {lockable = false, binary = true, min = 0, max = 1, step = 1})
         }
-      },
-      {
-        title = "MACHINE",
-        items = {}
       }
     },
     settings = {
@@ -99,6 +95,25 @@ local page_model = {
       item("trig_polyphony", "POLY", {options = 2}),
       item("playhead_return", "PHED", {options = 3})
     }
+  },
+  file = {
+    title = "FILE",
+    pages = {
+      {
+        title = "SAMPLE",
+        items = {
+          item("sample_bpm", "BPM", {lockable = false, min = 20, max = 300, step = 1, snaps = {60, 80, 90, 100, 110, 120, 128, 136, 140, 160, 180}}),
+          item("sample_steps", "STEP", {lockable = false, min = 1, max = 512, step = 1, snaps = {4, 8, 16, 32, 48, 64, 96, 128, 256, 512}}),
+          item("sample", "FILE", {file = true, lockable = false}),
+          item("sample_slot", "SLOT", {lockable = false, min = 1, max = 128, step = 1, snaps = {1, 2, 4, 8, 16, 32, 64, 128}}),
+          item("trim_start", "T-ST", {lockable = false, trim_scan = true, min = 0, max = 3600, step = 0.01, fine_step = 0.001}),
+          item("trim_end", "T-EN", {lockable = false, trim_scan = true, min = 0, max = 3600, step = 0.01, fine_step = 0.001}),
+          item("gain", "GAIN", {lockable = false, min = 0, max = 4, step = 0.01, snaps = {0, 0.5, 1, 1.5, 2, 3, 4}}),
+          item("sample_preview", "PREV", {lockable = false, binary = true, min = 0, max = 1, step = 1})
+        }
+      }
+    },
+    settings = {}
   },
   filter = {
     title = "FILTER",

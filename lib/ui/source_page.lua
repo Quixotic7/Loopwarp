@@ -170,6 +170,34 @@ function SourcePage:group_has_trim_items()
     or (right ~= nil and (right.id == "trim_start" or right.id == "trim_end"))
 end
 
+function SourcePage:group_has_range_items()
+  local left, right = self.nav:current_group_items()
+  return (left ~= nil and (left.id == "range_start" or left.id == "range_end"))
+    or (right ~= nil and (right.id == "range_start" or right.id == "range_end"))
+end
+
+-- Draws a start/end marker pair given their positions as fractions of the whole
+-- sample, mapped through the current view window. The end marker's rounding is
+-- anchored to the start's so the pixel gap between them stays constant while a
+-- linked start/end scrubs (avoids 1px jitter). Markers outside the view are
+-- skipped.
+function SourcePage:draw_marker_pair(start_frac, end_frac, view_lo, view_hi, x0, y0, width, height)
+  if view_hi <= view_lo then
+    return
+  end
+  local span = view_hi - view_lo
+  local start_exact = (width - 1) * ((util.clamp(start_frac, 0, 1) - view_lo) / span)
+  local end_exact = (width - 1) * ((util.clamp(end_frac, 0, 1) - view_lo) / span)
+  local start_px = math.floor(start_exact + 0.5)
+  local end_px = start_px + math.floor((end_exact - start_exact) + 0.5)
+  if start_frac >= view_lo and start_frac <= view_hi then
+    self:draw_marker_at_px(x0 + util.clamp(start_px, 0, width - 1), y0, height, "start")
+  end
+  if end_frac >= view_lo and end_frac <= view_hi then
+    self:draw_marker_at_px(x0 + util.clamp(end_px, 0, width - 1), y0, height, "end")
+  end
+end
+
 function SourcePage:draw_waveform(opts)
   opts = opts or {}
   local x0 = opts.x or 3
@@ -189,13 +217,34 @@ function SourcePage:draw_waveform(opts)
     trim_lo = util.clamp(trim_start / duration, 0, 1)
     trim_hi = util.clamp(trim_end / duration, trim_lo, 1)
   end
-  local view_lo = opts.sample_edit and 0 or trim_lo
-  local view_hi = opts.sample_edit and 1 or trim_hi
 
+  -- Range (0-128) nested inside the trim window, expressed as fractions of the
+  -- whole sample. The three sample pages are nested views: File shows [0,1] and
+  -- edits trim; Range shows [trim_lo,trim_hi] and edits range; Main shows the
+  -- range window and edits Track start/end.
+  local range_start_val = util.clamp(self.visual_param_value("range_start", 0), 0, 128)
+  local range_end_val = util.clamp(self.visual_param_value("range_end", 128), 0, 128)
+  local trim_span = trim_hi - trim_lo
+  local range_lo = util.clamp(trim_lo + (trim_span * (range_start_val / 128)), 0, 1)
+  local range_hi = util.clamp(trim_lo + (trim_span * (range_end_val / 128)), 0, 1)
+  if range_hi <= range_lo then
+    range_hi = math.min(1, range_lo + 0.001)
+  end
+
+  local view_lo, view_hi
+  if opts.sample_edit then
+    view_lo, view_hi = 0, 1
+  elseif opts.range_edit then
+    view_lo, view_hi = trim_lo, trim_hi
+  else
+    view_lo, view_hi = range_lo, range_hi
+  end
+
+  -- FN zoom is the Sample (file trim) page only. The Range page does not zoom
+  -- under FN -- there FN snaps the values to multiples of 8 instead.
   if opts.sample_edit and self.get_alt() and duration > 0 and self:group_has_trim_items() then
-    local last_trim_focus = self.get_last_trim_focus()
-    local focus = last_trim_focus == "trim_end" and trim_end or trim_start
-    local zoom_span = util.clamp(0.5 / duration, 0.02, 0.2)
+    local zoom_span = util.clamp(4.0 / duration, 0.04, 0.4)
+    local focus = self.get_last_trim_focus() == "trim_end" and trim_end or trim_start
     local focus_fraction = util.clamp(focus / duration, 0, 1)
     view_lo = util.clamp(focus_fraction - (zoom_span / 2), 0, math.max(0, 1 - zoom_span))
     view_hi = util.clamp(view_lo + zoom_span, view_lo + 0.001, 1)
@@ -256,28 +305,15 @@ function SourcePage:draw_waveform(opts)
 
   if opts.sample_edit then
     screen.level(9)
-    if duration > 0 and view_hi > view_lo then
-      -- Anchor the end marker's rounding to the start marker's so the pixel gap
-      -- between them stays constant while trim start scrubs (they move by an
-      -- equal delta). Rounding each independently made the gap jitter by a pixel
-      -- as the sub-pixel remainders drifted past .5 at different moments.
-      local start_frac = util.clamp(trim_start / duration, 0, 1)
-      local end_frac = util.clamp(trim_end / duration, 0, 1)
-      local span = view_hi - view_lo
-      local start_exact = (width - 1) * ((start_frac - view_lo) / span)
-      local end_exact = (width - 1) * ((end_frac - view_lo) / span)
-      local start_px = math.floor(start_exact + 0.5)
-      local end_px = start_px + math.floor((end_exact - start_exact) + 0.5)
-      if start_frac >= view_lo and start_frac <= view_hi then
-        self:draw_marker_at_px(x0 + util.clamp(start_px, 0, width - 1), y0, height, "start")
-      end
-      if end_frac >= view_lo and end_frac <= view_hi then
-        self:draw_marker_at_px(x0 + util.clamp(end_px, 0, width - 1), y0, height, "end")
-      end
+    if duration > 0 then
+      self:draw_marker_pair(trim_start / duration, trim_end / duration, view_lo, view_hi, x0, y0, width, height)
     else
-      draw_fraction_marker(duration > 0 and (trim_start / duration) or 0, "start")
-      draw_fraction_marker(duration > 0 and (trim_end / duration) or 1, "end")
+      draw_fraction_marker(0, "start")
+      draw_fraction_marker(1, "end")
     end
+  elseif opts.range_edit then
+    screen.level(9)
+    self:draw_marker_pair(range_lo, range_hi, view_lo, view_hi, x0, y0, width, height)
   else
     screen.level(9)
     self:draw_waveform_marker(visual_start, x0, y0, width, height, "start")
@@ -288,80 +324,79 @@ function SourcePage:draw_waveform(opts)
   end
 end
 
-function SourcePage:draw_sample_cell(param_item, index, corner)
-  if param_item == nil then
-    return
+-- Draws param cells for the K2/K3 group model, rendered at cell positions
+-- offset by cell_offset (Range's items live at list indices 1-3 -- so K2/K3
+-- default to them -- but render on the bottom row via cell_offset 4).
+function SourcePage:draw_editor_cells(items, cell_offset)
+  cell_offset = cell_offset or 0
+  local selected_start = ((self.nav:clamp_current_group() - 1) * 2) + 1
+  for i = 1, 8 do
+    local param_item = items[i]
+    if param_item ~= nil then
+      local corner = nil
+      if i == selected_start then
+        corner = "tl"
+      elseif i == selected_start + 1 then
+        corner = "br"
+      end
+      self:draw_main_cell(param_item, i + cell_offset, corner)
+    end
   end
-
-  local column = (index - 1) % 4
-  local row = math.floor((index - 1) / 4)
-  local x = column * 32
-  local y = row == 0 and 19 or 59
-  local width = 30
-
-  if corner ~= nil then
-    self.ParamRenderer.draw_selection_corner(x, y - 8, width, 11, corner)
-  end
-
-  if param_item.blank then
-    return
-  end
-
-  local text = (self.param_values:item_value_flashing(param_item) or self.param_values:item_locked(param_item)) and self.param_values:item_display_value(param_item) or (param_item.short or param_item.id)
-
-  screen.level(self.param_values:item_locked(param_item) and 12 or (corner ~= nil and 15 or 9))
-  screen.move(x + 2, y)
-  self.ParamRenderer.draw_cell_value(text, width - 4)
 end
 
-function SourcePage:draw_main_page(items, page_number)
-  local machine = self.param_value_or("machine", 1)
-  self.draw_page_header("", page_number)
+-- Shared renderer for every sample-style page (Source main, File editor, Range)
+-- so they read as one uniform layout: header + full-width waveform + the 4x2
+-- cell grid, differing only in waveform view mode and where the cells sit.
+function SourcePage:draw_editor(opts)
+  self.draw_page_header(opts.title or "", opts.page_number or 1)
   self:draw_waveform({
     x = 1,
     y = SOURCE_WAVEFORM_Y,
     width = 127,
     height = SOURCE_WAVEFORM_HEIGHT,
+    show_slices = opts.show_slices,
+    sample_edit = opts.sample_edit,
+    range_edit = opts.range_edit
+  })
+  self:draw_editor_cells(opts.items, opts.cell_offset)
+end
+
+function SourcePage:draw_main_page(items, page_number)
+  local machine = self.param_value_or("machine", 1)
+  self:draw_editor({
+    items = items,
+    page_number = page_number,
+    title = "",
     show_slices = self.MachineRegistry.is_slice(machine)
   })
+end
 
-  local selected_start = ((self.nav:clamp_current_group() - 1) * 2) + 1
-  for i = 1, 8 do
-    local param_item = items[i]
-    local corner = nil
-    if i == selected_start then
-      corner = "tl"
-    elseif i == selected_start + 1 then
-      corner = "br"
-    end
-    self:draw_main_cell(param_item, i, corner)
-  end
+function SourcePage:draw_file_page(page, items)
+  local slot = self.elasticat.active_pool_slot ~= nil and self.elasticat.active_pool_slot() or self.param_value_or("sample_slot", 1)
+  self:draw_editor({
+    items = items,
+    page_number = self.nav.page_index_by_category.file or 1,
+    title = string.format("%03d %s", slot, self.sample_name()),
+    sample_edit = true
+  })
 end
 
 function SourcePage:draw_sample_page(page, items)
-  local slot = self.elasticat.active_pool_slot ~= nil and self.elasticat.active_pool_slot() or self.param_value_or("sample_slot", 1)
   local page_index = self.nav.page_index_by_category.source or 1
   if page_index == 1 then
     self:draw_main_page(items, page_index)
     return
   end
 
-  self.draw_page_header(string.format("%03d %s", slot, self.sample_name()), page_index)
-  self:draw_waveform({
-    show_slices = false,
-    sample_edit = page_index == 3
+  -- Range page (4): edit params live on the bottom row (cell_offset 4) so they
+  -- line up with the trim params on the File page.
+  self:draw_editor({
+    items = items,
+    page_number = page_index,
+    title = "RANGE",
+    range_edit = true,
+    cell_offset = 4
   })
-
-  local selected_start = ((self.nav:clamp_current_group() - 1) * 2) + 1
-  for i, param_item in ipairs(items) do
-    local corner = nil
-    if i == selected_start then
-      corner = "tl"
-    elseif i == selected_start + 1 then
-      corner = "br"
-    end
-    self:draw_sample_cell(param_item, i, corner)
-  end
 end
 
 return SourcePage

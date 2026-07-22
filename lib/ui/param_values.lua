@@ -68,6 +68,8 @@ local ID_FORMATTERS = {
   default_velocity = fmt_percent,
   loop_start = fmt_0dp,
   loop_end = fmt_0dp,
+  range_start = fmt_0dp,
+  range_end = fmt_0dp,
   trim_start = fmt_3dp,
   trim_end = fmt_3dp,
   gain = fmt_2dp_x,
@@ -103,6 +105,7 @@ function ParamValues.new(opts)
     get_default_trig_velocity = opts.get_default_trig_velocity,
     set_default_trig_velocity = opts.set_default_trig_velocity,
     set_last_trim_focus = opts.set_last_trim_focus,
+    get_sample_duration = opts.get_sample_duration,
     active_step_lock_bases = opts.active_step_lock_bases or {},
     active_step_lock_ids = opts.active_step_lock_ids or {},
     value_flash_until = opts.value_flash_until or {},
@@ -326,14 +329,48 @@ function ParamValues:snap_value(param_item, current, delta)
   return snaps[1]
 end
 
+-- Snap to the next multiple of `mult` strictly past `current`, in the direction
+-- of `delta`. Used by Range's FN behavior (multiples of 8).
+function ParamValues:snap_to_multiple(param_item, current, delta, mult)
+  local snapped
+  if delta >= 0 then
+    snapped = (math.floor(current / mult + 1e-6) + 1) * mult
+  else
+    snapped = (math.ceil(current / mult - 1e-6) - 1) * mult
+  end
+  return util.clamp(snapped, param_item.min or 0, param_item.max or (current + snapped))
+end
+
 function ParamValues:adjusted_value(param_item, current, delta, snap)
   if param_item.options ~= nil then
     return util.clamp(math.floor(current + (delta >= 0 and 1 or -1)), 1, param_item.options)
-  elseif snap and param_item.fine_step == nil then
-    return self:snap_value(param_item, current, delta)
   end
 
-  local step = (self.get_alt() and param_item.fine_step) or param_item.step or 1
+  -- FN held (snap == fn_active): default is snap-to-useful-values. Trim scans
+  -- drop to a fine step instead (they get a zoomed view for precision), and
+  -- Range snaps to fixed multiples.
+  if snap then
+    if param_item.trim_scan then
+      local step = param_item.fine_step or param_item.step or 1
+      return util.clamp(current + (delta * step), param_item.min or current, param_item.max or current)
+    elseif param_item.fn_snap_multiple ~= nil then
+      return self:snap_to_multiple(param_item, current, delta, param_item.fn_snap_multiple)
+    elseif param_item.snaps ~= nil and #param_item.snaps > 0 then
+      return self:snap_value(param_item, current, delta)
+    end
+    local step = param_item.fine_step or param_item.step or 1
+    return util.clamp(current + (delta * step), param_item.min or current, param_item.max or current)
+  end
+
+  -- FN not held: normal increments. Trim scans one ~1/128-of-sample detent so
+  -- scrubbing a long file feels like the 0-128 sample views.
+  local step
+  if param_item.trim_scan and self.get_sample_duration ~= nil then
+    local duration = self.get_sample_duration() or 0
+    step = duration > 0 and (duration / 128) or (param_item.step or 1)
+  else
+    step = param_item.step or 1
+  end
   return util.clamp(current + (delta * step), param_item.min or current, param_item.max or current)
 end
 
@@ -369,11 +406,14 @@ function ParamValues:apply_item_value(param_item, value)
 end
 
 function ParamValues:apply_param_lock_value(lock_id, value)
-  -- loop_start/loop_end locks are read directly by GridSequencer:locked_region
-  -- at trigger time; applying them here too would temporarily overwrite the
-  -- persistent track-base param that base_region() reads, which grid
-  -- interactions (release-to-base-region, etc.) rely on staying untouched.
-  if lock_id == "length" or lock_id == "velocity" or lock_id == "loop_start" or lock_id == "loop_end" then
+  -- These locks are layered by GridSequencer, not written to their track-base
+  -- param: loop_start/loop_end feed the active-region resolve; range_start/
+  -- range_end feed the active-range override (map_trim_point). Writing them here
+  -- would corrupt the Track values the page shows and make them jump around as
+  -- steps trigger. length/velocity are consumed at trigger time, not as params.
+  if lock_id == "length" or lock_id == "velocity"
+    or lock_id == "loop_start" or lock_id == "loop_end"
+    or lock_id == "range_start" or lock_id == "range_end" then
     return
   end
   local full_id = self.id(lock_id)
@@ -424,12 +464,32 @@ function ParamValues:delta_item(param_item, delta)
   local current = locking and (grid_ui:held_param_lock(lock_id) or self:item_raw_value(param_item)) or self:item_raw_value(param_item)
   local next_value = self:adjusted_value(param_item, current, delta, self.get_alt())
 
-  if param_item.id == "trim_start" or param_item.id == "trim_end" then
+  if param_item.id == "trim_start" or param_item.id == "trim_end"
+    or param_item.id == "range_start" or param_item.id == "range_end" then
+    -- Tracks which trim/range endpoint was last touched so the waveform page
+    -- can zoom around it under FN. One tracker serves both pairs; each page
+    -- reads only its own ids.
     self.set_last_trim_focus(param_item.id)
   end
 
   if locking then
-    grid_ui:set_held_param_lock(lock_id, next_value)
+    if lock_id == "range_start" and self.param_value_or("range_end_sync", 1) == 1 then
+      -- E-SNC: range start/end lock as a rigid pair -- clamped shared delta so
+      -- the gap never collapses at 0/128 (matches the live encoder link).
+      local base_end = grid_ui:held_param_lock("range_end") or self.param_value_or("range_end", 128)
+      local delta = util.clamp(next_value - current, -current, 128 - base_end)
+      grid_ui:set_held_param_lock("range_start", current + delta)
+      grid_ui:set_held_param_lock("range_end", base_end + delta)
+    elseif lock_id == "range_start" then
+      -- Independent: the locked start can't reach the locked (or track) end.
+      local end_ref = grid_ui:held_param_lock("range_end") or self.param_value_or("range_end", 128)
+      grid_ui:set_held_param_lock(lock_id, util.clamp(next_value, 0, math.max(0, end_ref - 1)))
+    elseif lock_id == "range_end" then
+      local start_ref = grid_ui:held_param_lock("range_start") or self.param_value_or("range_start", 0)
+      grid_ui:set_held_param_lock(lock_id, util.clamp(next_value, math.min(128, start_ref + 1), 128))
+    else
+      grid_ui:set_held_param_lock(lock_id, next_value)
+    end
     self:flash_item_value(param_item)
     self.show_message(self:item_long_name(param_item) .. " lock " .. self:format_item_value(param_item, next_value))
   else

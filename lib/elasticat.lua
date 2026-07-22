@@ -177,13 +177,54 @@ local function trim_bounds(slot)
   return trim_start, trim_end, duration
 end
 
+-- Active Range override: the three-layer model the loop region also uses. Track
+-- Range = the range_start/range_end params (what the Range page edits, never
+-- touched by step locks). Step Range = a triggering step's range lock, pushed
+-- here by GridSequencer. Actual Range (used below) = Step Range when set, else
+-- Track Range. nil per endpoint means "fall through to the Track param".
+local active_range_start = nil
+local active_range_end = nil
+
+function elasticat.set_active_range(range_start, range_end)
+  active_range_start = range_start
+  active_range_end = range_end
+end
+
+-- Range Start/End (0-128) carve a live performance window *inside* the file
+-- trim window: 0 = trim start, 128 = trim end. Unlike file trim (saved per
+-- sample) this is a global, p-lockable layer. Returns the window in seconds.
+local function range_bounds(trim_start, trim_end)
+  local span = trim_end - trim_start
+  local range_start = active_range_start
+  local range_end = active_range_end
+  if range_start == nil and ids.range_start ~= nil and params:lookup_param(ids.range_start) ~= nil then
+    range_start = params:get(ids.range_start)
+  end
+  if range_end == nil and ids.range_end ~= nil and params:lookup_param(ids.range_end) ~= nil then
+    range_end = params:get(ids.range_end)
+  end
+  range_start = range_start or 0
+  range_end = range_end or 128
+  local lo = trim_start + (span * (util.clamp(range_start, 0, 128) / 128))
+  local hi = trim_start + (span * (util.clamp(range_end, 0, 128) / 128))
+  if hi <= lo then
+    hi = math.min(trim_end, lo + 0.0001)
+  end
+  return lo, hi
+end
+
+-- Maps a Track point (0-128) through Range, then File Trim, into engine 0-128
+-- (of the whole sample). One funnel: every engine region call (loop points,
+-- slice ranges, set_loop_region) goes through here, so both the Range and the
+-- File Trim layers apply everywhere with no downstream changes.
 local function map_trim_point(point, slot)
   local trim_start, trim_end, duration = trim_bounds(slot)
   if duration <= 0 then
     return util.clamp(point or 0, 0, 128)
   end
+  local range_lo, range_hi = range_bounds(trim_start, trim_end)
   local fraction = util.clamp(point or 0, 0, 128) / 128
-  return ((trim_start + ((trim_end - trim_start) * fraction)) / duration) * 128
+  return ((range_lo + ((range_hi - range_lo) * fraction)) / duration) * 128
 end
 
 local function update_engine_loop_points()
@@ -556,6 +597,33 @@ function elasticat.set_loop_region(start_point, end_point, reset_playhead)
   end
 end
 
+-- Auditions the current sample's *file trim* window (bypassing Range and Track,
+-- which is what the File page is for), looping it. Only engages while master
+-- transport is stopped so it never fights sequenced playback.
+function elasticat.preview_trim(on)
+  if on then
+    if ids.play ~= nil and params:get(ids.play) == 1 then
+      return
+    end
+    local trim_start, trim_end, duration = trim_bounds()
+    local lo, hi = 0, 128
+    if duration > 0 then
+      lo = util.clamp((trim_start / duration) * 128, 0, 127.99)
+      hi = util.clamp((trim_end / duration) * 128, lo + 0.01, 128)
+    end
+    flush_engine_sends()
+    if engine.loopRegionPlayhead ~= nil then
+      engine_call("loopRegionPlayhead", lo, hi, 0)
+    else
+      engine_call("loopStart", lo)
+      engine_call("loopEnd", hi)
+    end
+    elasticat.play(true)
+  else
+    elasticat.play(false)
+  end
+end
+
 function elasticat.active_pool_slot()
   return active_sample_slot
 end
@@ -715,6 +783,10 @@ function elasticat.params(options)
   ids.default_velocity = param_id(prefix, "default_velocity")
   ids.loop_start = param_id(prefix, "loop_start")
   ids.loop_end = param_id(prefix, "loop_end")
+  ids.range_start = param_id(prefix, "range_start")
+  ids.range_end = param_id(prefix, "range_end")
+  ids.range_end_sync = param_id(prefix, "range_end_sync")
+  ids.sample_preview = param_id(prefix, "sample_preview")
   ids.mode_macro = param_id(prefix, "mode_macro")
   ids.mode_switch_fade = param_id(prefix, "mode_switch_fade")
   ids.debug = param_id(prefix, "debug")
@@ -946,6 +1018,68 @@ function elasticat.params(options)
   add_control(ids.loop_end, "sample end",
     cs.new(0, 128, "lin", 0.01, 128, "", 1 / 128),
     function(x) queue_engine_call(ids.loop_end, "loopEnd", map_trim_point(x)) end)
+
+  -- Range narrows the trim window; changing it re-maps the current loop points
+  -- through map_trim_point. During sequenced playback the grid re-sets the
+  -- region every step, so this just handles the base/encoder-driven case.
+  local last_range_start = 0
+
+  add_control(ids.range_start, "range start",
+    cs.new(0, 128, "lin", 0.01, 0, "", 1 / 128),
+    function(x)
+      -- When E-SNC is on, range start and end move as one rigid pair: the shared
+      -- delta is clamped so end stays <= 128 and start stays >= 0, which keeps
+      -- the length constant even on a fast overshoot into the boundary. (Moving
+      -- end freely then clamping only end used to collapse the gap at 128 and
+      -- then drag end back down on the way out -- the "bounce to 120".)
+      if ids.range_end_sync ~= nil and params:get(ids.range_end_sync) == 1 then
+        local prev_start = last_range_start
+        local prev_end = params:get(ids.range_end) or 128
+        local delta = util.clamp(x - prev_start, -prev_start, 128 - prev_end)
+        local next_start = prev_start + delta
+        local next_end = prev_end + delta
+        if math.abs(next_start - x) > 0.000001 then
+          params:set(ids.range_start, next_start, true)
+        end
+        params:set(ids.range_end, next_end, true)
+        last_range_start = next_start
+      else
+        -- Independent: start can never reach end. Clamp to end - 1 (so its max
+        -- is 127 when end is 128), which stops the start marker at the end
+        -- rather than crossing it.
+        local max_start = util.clamp((params:get(ids.range_end) or 128) - 1, 0, 127)
+        if x > max_start then
+          params:set(ids.range_start, max_start, true)
+          last_range_start = max_start
+        else
+          last_range_start = x
+        end
+      end
+      update_engine_loop_points()
+    end)
+
+  add_control(ids.range_end, "range end",
+    cs.new(0, 128, "lin", 0.01, 128, "", 1 / 128),
+    function(x)
+      -- End can never reach start: its minimum is start + 1.
+      local min_end = util.clamp((params:get(ids.range_start) or 0) + 1, 1, 128)
+      if x < min_end then
+        params:set(ids.range_end, min_end, true)
+      end
+      update_engine_loop_points()
+    end)
+
+  -- E-SNC: when on, range end tracks range start (see range_start action and the
+  -- grid p-lock auto-lock in param_values). Pure UI behavior, no engine action.
+  params:add_binary(ids.range_end_sync, "range end sync", "toggle", 1)
+
+  -- Sample preview: momentary audition of the current sample's trim window,
+  -- only while master playback is stopped (see elasticat.preview_trim). Driven
+  -- by encoder on the File page and/or a grid hold.
+  params:add_binary(ids.sample_preview, "sample preview", "toggle", 0)
+  params:set_action(ids.sample_preview, function(x)
+    elasticat.preview_trim(x == 1)
+  end)
 
   add_control(param_id(prefix, "xfade"), "loop xfade",
     cs.new(0, 0.25, "lin", 0.001, 0.005, "", 0.004),

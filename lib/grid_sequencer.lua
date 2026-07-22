@@ -19,7 +19,8 @@ local WHITE_KEYS = {[1] = 0, [2] = 2, [3] = 4, [4] = 5, [5] = 7, [6] = 9, [7] = 
 local BLACK_KEYS = {[2] = 1, [3] = 3, [5] = 6, [6] = 8, [7] = 10}
 local CATEGORY_KEYS = {
   [7] = "master",
-  [8] = "pattern",
+  [8] = "file",
+  [9] = "pattern",
   [11] = "trig",
   [12] = "source",
   [13] = "filter",
@@ -110,6 +111,8 @@ function GridSequencer.new(options)
   self.param_lock_holds = {}
   self.current_region_start = nil
   self.current_region_end = nil
+  self.current_range_start = nil
+  self.current_range_end = nil
   self.g.key = function(x, y, z) self:key(x, y, z) end
   return self
 end
@@ -721,6 +724,38 @@ function GridSequencer:resolve_active_region()
   return start_point, end_point
 end
 
+-- Step Range -> Active Range override. Range (0-128 window inside file trim) is
+-- layered exactly like the loop region: the range_start/range_end params are the
+-- Track Range (edited on the Range page, never touched by step locks), a
+-- triggering step's range lock is the Step Range, and the engine plays the
+-- Actual Range. We push the Step Range (nil per endpoint = fall back to Track)
+-- to the coordinator, which sets it on map_trim_point. A change also invalidates
+-- the region cache so the next set_region re-maps the engine points.
+function GridSequencer:push_active_range(range_start, range_end)
+  if self.options.set_active_range == nil then
+    return
+  end
+  if range_start ~= self.current_range_start or range_end ~= self.current_range_end then
+    self.options.set_active_range(range_start, range_end)
+    self.current_range_start = range_start
+    self.current_range_end = range_end
+    self.current_region_start = nil
+  end
+end
+
+-- During playback the Step Range lives in param_lock_holds (with the note-length
+-- expiry), the same store the loop region uses -- so it reverts to Track Range
+-- on its own when the step's window elapses.
+function GridSequencer:apply_active_range()
+  if self.options.set_active_range == nil then
+    return
+  end
+  self:expire_param_lock_holds(util.time())
+  local range_start = self.param_lock_holds.range_start and self.param_lock_holds.range_start.value or nil
+  local range_end = self.param_lock_holds.range_end and self.param_lock_holds.range_end.value or nil
+  self:push_active_range(range_start, range_end)
+end
+
 -- Best estimate of the current absolute playback position (0-128) within the
 -- region currently loaded in the engine, used to preserve position across a
 -- region change (Boomerang playhead return, sequencer revert continuity).
@@ -805,6 +840,9 @@ function GridSequencer:enter_step(reset_sequence)
     self.options.apply_step_param_locks(self:effective_param_locks(record))
   end
   self:apply_step_pitch(record)
+  -- Push the Step Range before any region set, so the region maps through the
+  -- correct (Actual) range in the same tick.
+  self:apply_active_range()
 
   if machine == MACHINE_LOOP then
     -- A step that carries an explicit region lock jumps the playhead to the new
@@ -884,6 +922,7 @@ function GridSequencer:stop_sequence()
   self.play_index = 1
   self:sync_play_page_step()
   self:clear_param_lock_holds()
+  self:push_active_range(nil, nil)
   local start_point, end_point = self:base_region()
   self:set_region_with_phase(start_point, end_point, 0)
   if self.options.apply_step_param_locks ~= nil then
@@ -923,9 +962,10 @@ function GridSequencer:tick_sequence()
     if self.options.apply_step_param_locks ~= nil then
       self.options.apply_step_param_locks(self:effective_param_locks(nil))
     end
-    -- A region lock that just expired (note-length window elapsed) means the
-    -- active region should revert to whatever the remaining layers resolve to,
-    -- without disturbing the playhead position.
+    -- A region/range lock that just expired (note-length window elapsed) means
+    -- the active region/range should revert to whatever the remaining layers
+    -- resolve to, without disturbing the playhead position.
+    self:apply_active_range()
     if self:machine() == MACHINE_LOOP then
       local start_point, end_point = self:resolve_active_region()
       self:set_region(start_point, end_point)
@@ -1045,6 +1085,15 @@ function GridSequencer:key(x, y, z)
     return
   end
 
+  -- YES (11,6): a context key. On the File page it holds-to-preview the sample.
+  -- Handled here (not in the z==1-only navigation path) so it sees key release.
+  if x == 11 and y == 6 then
+    self:key_yes(z)
+    self:redraw()
+    self:request_redraw()
+    return
+  end
+
   if y == 1 and CATEGORY_KEYS[x] ~= nil and z == 1 then
     self:key_category(CATEGORY_KEYS[x])
   elseif y == 1 then
@@ -1071,6 +1120,21 @@ function GridSequencer:key(x, y, z)
 
   self:redraw()
   self:request_redraw()
+end
+
+function GridSequencer:current_category()
+  if self.options.current_param_category ~= nil then
+    return self.options.current_param_category()
+  end
+  return nil
+end
+
+-- YES key. Context-dependent; only the File-page hold-to-preview is wired so
+-- far. Preview itself only engages while master transport is stopped.
+function GridSequencer:key_yes(z)
+  if self:current_category() == "file" and self.options.set_sample_preview ~= nil then
+    self.options.set_sample_preview(z == 1)
+  end
 end
 
 function GridSequencer:key_category(category)
@@ -1411,6 +1475,10 @@ function GridSequencer:key_step_row(x, z)
       -- TODO(ghost triggers, task #23): once ghost steps exist, skip preview
       -- for record.ghost the same way sequenced playback will.
       if record ~= nil and record.trig == true then
+        -- Apply the step's Step Range before setting the region so the preview
+        -- plays the step's range window, not the whole trim.
+        local locks = record.param_locks or {}
+        self:push_active_range(locks.range_start, locks.range_end)
         local start_point, end_point = self:locked_region(record)
         self:set_region_with_phase(start_point, end_point, 0)
         self:apply_step_pitch(record)
@@ -1429,6 +1497,9 @@ function GridSequencer:key_step_row(x, z)
       self:toggle_step(self.selected_page, x)
     end
     if not any_keys(self.step_holds) and not any_keys(self.loop_holds) then
+      if not self.playing then
+        self:push_active_range(nil, nil)
+      end
       local base_start, base_end = self:base_region()
       self:set_region(base_start, base_end)
       if not self.playing then

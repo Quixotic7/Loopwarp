@@ -1,7 +1,7 @@
 local PageModel = include("lib/pages/model")
 local ParamBank = include("lib/ui/param_bank")
 
-local CATEGORY_ORDER = {"master", "pattern", "trig", "source", "filter", "amp", "fx", "mod"}
+local CATEGORY_ORDER = {"master", "file", "pattern", "trig", "source", "filter", "amp", "fx", "mod"}
 
 local Navigation = {}
 Navigation.__index = Navigation
