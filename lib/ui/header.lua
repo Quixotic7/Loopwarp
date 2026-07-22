@@ -117,14 +117,16 @@ function Header.draw(opts)
     screen.text_center(tostring(opts.track or 1))
   end
 
+  -- Explicit level: the ghost icon leaves screen.level at BACKGROUND_LEVEL, so
+  -- without this the message/tempo would render invisibly on the same-level bg.
+  screen.level(0)
   screen.move(Header.SEPARATOR_X + 2, 7)
   screen.text_trim(message, 76)
 
+  screen.move(117, 7)
   if tempo ~= nil then
-    screen.move(117, 7)
     screen.text_right(string.format("%.1f", tempo))
   else
-    screen.move(117, 7)
     screen.text_right(opts.state or "")
   end
 
