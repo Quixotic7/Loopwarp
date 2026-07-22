@@ -95,7 +95,6 @@ local page_model = {
     },
     settings = {
       item("machine", "MACH", {options = 4}),
-      item("mode", "WARP", {options = 6}),
       item("loop_division", "LDIV", {lockable = false, min = 2, max = 32, step = 2, snaps = {2, 4, 8, 16, 32}}),
       item("trig_polyphony", "POLY", {options = 2}),
       item("playhead_return", "PHED", {options = 3})
@@ -107,8 +106,8 @@ local page_model = {
       {
         title = "SAMPLE",
         items = {
-          item("sample_bpm", "BPM", {lockable = false, min = 20, max = 300, step = 1, snaps = {60, 80, 90, 100, 110, 120, 128, 136, 140, 160, 180}}),
-          item("sample_steps", "STEP", {lockable = false, min = 1, max = 512, step = 1, snaps = {4, 8, 16, 32, 48, 64, 96, 128, 256, 512}}),
+          item("sample_bpm", "BPM", {lockable = false, always_value = true, min = 20, max = 300, step = 1, snaps = {60, 80, 90, 100, 110, 120, 128, 136, 140, 160, 180}}),
+          item("sample_steps", "STEP", {lockable = false, always_value = true, min = 1, max = 512, step = 1, snaps = {4, 8, 16, 32, 48, 64, 96, 128, 256, 512}}),
           item("sample", "FILE", {file = true, lockable = false}),
           item("sample_slot", "SLOT", {lockable = false, min = 0, max = 128, step = 1, snaps = {0, 1, 2, 4, 8, 16, 32, 64, 128}}),
           item("trim_start", "T-ST", {lockable = false, trim_scan = true, min = 0, max = 3600, step = 0.01, fine_step = 0.001}),
@@ -118,7 +117,10 @@ local page_model = {
         }
       }
     },
-    settings = {}
+    settings = {
+      item("bpm_step_mode", "BPM/STEP MODE", {options = 4}),
+      item("recalc_bpm_steps", "RECALC BPM/STEP", {options = 2})
+    }
   },
   filter = {
     title = "FILTER",

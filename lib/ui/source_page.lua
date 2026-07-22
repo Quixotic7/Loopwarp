@@ -137,7 +137,12 @@ function SourcePage:draw_main_cell(param_item, index, corner)
   elseif param_item.id == "sample_slot" then
     self:draw_sample_slot_tab(param_item, x, y, locked)
   else
-    local text = (self.param_values:item_value_flashing(param_item) or locked) and self.param_values:item_display_value(param_item) or (param_item.short or param_item.id)
+    -- Show the value when flashing/locked, when the item asks to always show it
+    -- (BPM/STEP), or while FN is held (peek all values); otherwise the label.
+    local fn_held = self.get_alt ~= nil and self.get_alt()
+    local show_value = self.param_values:item_value_flashing(param_item) or locked
+      or param_item.always_value == true or fn_held
+    local text = show_value and self.param_values:item_display_value(param_item) or (param_item.short or param_item.id)
     self:draw_text(text, x, y, locked)
   end
 end

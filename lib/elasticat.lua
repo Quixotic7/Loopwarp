@@ -731,6 +731,30 @@ function elasticat.set_pool_slot(slot)
   set_active_pool_slot(slot)
 end
 
+-- Recompute BPM (filename, else keep current) and steps (from duration * bpm)
+-- for the active sample slot, applying to the pool + params + engine.
+function elasticat.recalc_bpm_steps()
+  local slot = active_sample_slot
+  local path = sample_pool.paths[slot]
+  local samples = sample_pool.samples[slot] or 0
+  local rate = sample_pool.rates[slot] or 0
+  if path == nil or samples <= 0 or rate <= 0 then
+    return
+  end
+  local duration = samples / rate
+  local bpm = bpm_from_filename(path) or sample_pool.bpms[slot] or 120
+  local steps = quantize_steps(duration * bpm / 60 * 4)
+  sample_pool.bpms[slot] = bpm
+  sample_pool.steps[slot] = steps
+  if params:lookup_param(ids.sample_bpm) ~= nil then
+    params:set(ids.sample_bpm, bpm)
+  end
+  if params:lookup_param(ids.sample_steps) ~= nil then
+    params:set(ids.sample_steps, steps)
+  end
+  mark_pool_dirty(slot)
+end
+
 function elasticat.load_pool_slot(slot, path, make_active)
   if math.floor((tonumber(slot) or 1) + 0.5) < 1 then
     print("elasticat: slot 0 is Off; cannot load a sample there")
@@ -757,9 +781,27 @@ function elasticat.load_pool_slot(slot, path, make_active)
   local filename_bpm = bpm_from_filename(path)
   local sidecar = read_sample_sidecar(path)
   local duration = samples / rate
-  local bpm = sidecar.bpm or filename_bpm or sample_pool.bpms[slot] or (params:lookup_param(ids.sample_bpm) ~= nil and params:get(ids.sample_bpm) or 120)
-  local inferred_steps = quantize_steps((samples / rate) * bpm / 60 * 4)
-  local steps = sidecar.steps or inferred_steps
+  local param_bpm = params:lookup_param(ids.sample_bpm) ~= nil and params:get(ids.sample_bpm) or 120
+  local param_steps = params:lookup_param(ids.sample_steps) ~= nil and params:get(ids.sample_steps) or 16
+  -- BPM/step derivation mode: 1 auto (json > filename > current), 2 no change
+  -- (keep current), 3 json only, 4 filename only. Governs whether a load
+  -- overrides the BPM/steps you already dialed in.
+  local mode = ids.bpm_step_mode ~= nil and params:lookup_param(ids.bpm_step_mode) ~= nil
+    and params:get(ids.bpm_step_mode) or 1
+  local bpm, steps
+  if mode == 2 then
+    bpm = sample_pool.bpms[slot] or param_bpm
+    steps = sample_pool.steps[slot] or param_steps
+  elseif mode == 3 then
+    bpm = sidecar.bpm or sample_pool.bpms[slot] or param_bpm
+    steps = sidecar.steps or quantize_steps(duration * bpm / 60 * 4)
+  elseif mode == 4 then
+    bpm = filename_bpm or sample_pool.bpms[slot] or param_bpm
+    steps = quantize_steps(duration * bpm / 60 * 4)
+  else
+    bpm = sidecar.bpm or filename_bpm or sample_pool.bpms[slot] or param_bpm
+    steps = sidecar.steps or quantize_steps(duration * bpm / 60 * 4)
+  end
   local trim_start = util.clamp(sidecar.trim_start or sample_pool.trim_starts[slot] or 0, 0, duration)
   local trim_end = util.clamp(sidecar.trim_end or sample_pool.trim_ends[slot] or duration, 0, duration)
   if trim_end <= trim_start then
@@ -830,6 +872,8 @@ function elasticat.params(options)
   ids.target_bpm = param_id(prefix, "target_bpm")
   ids.sample_bpm = param_id(prefix, "sample_bpm")
   ids.sample_steps = param_id(prefix, "sample_steps")
+  ids.bpm_step_mode = param_id(prefix, "bpm_step_mode")
+  ids.recalc_bpm_steps = param_id(prefix, "recalc_bpm_steps")
   ids.trim_start = param_id(prefix, "trim_start")
   ids.trim_end = param_id(prefix, "trim_end")
   ids.gain = param_id(prefix, "gain")
@@ -998,6 +1042,19 @@ function elasticat.params(options)
       queue_engine_call(ids.sample_steps, "setSampleSteps", x)
     end,
     function(param) return tostring(math.floor(param:get() + 0.5)) end)
+
+  params:add_option(ids.bpm_step_mode, "bpm/step mode",
+    {"auto", "no change", "json", "filename"}, 1)
+
+  -- Recalc trigger: selecting "run" recompiles BPM (filename, else current) and
+  -- steps for the active sample slot, then snaps back to "-".
+  params:add_option(ids.recalc_bpm_steps, "recalc bpm/steps", {"-", "run"}, 1)
+  params:set_action(ids.recalc_bpm_steps, function(x)
+    if x == 2 then
+      elasticat.recalc_bpm_steps()
+      params:set(ids.recalc_bpm_steps, 1, true)
+    end
+  end)
 
   add_control(ids.trim_start, "sample trim start",
     cs.new(0, 3600, "lin", 0.001, 0, "s", 0.001),
@@ -1177,7 +1234,7 @@ function elasticat.params(options)
     function(x) queue_engine_call(ids.mode_switch_fade, "setModeSwitchFade", x) end)
 
   add_control(param_id(prefix, "chop_steps"), "chop steps",
-    cs.new(0.25, 16, "lin", 0.25, 1, "steps", 0.25 / 15.75),
+    cs.new(0.05, 16, "lin", 0.05, 1, "steps", 0.05 / 15.95),
     function(x) queue_engine_call(param_id(prefix, "chop_steps"), "chopSteps", x) end)
 
   params:add_option(param_id(prefix, "chop_loop_mode"), "chop loop mode", {"forward stop", "loop forward", "ping pong"}, 1)

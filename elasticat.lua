@@ -22,7 +22,7 @@ local redraw_metro = nil
 local redraw_pending = true
 local grid_ui = nil
 local ui_message = nil
-local ui_message_clock = nil
+local ui_message_until = 0
 local loop_trig_gate_clock = nil
 local loop_trig_gate_token = 0
 local previous_osc_event = osc.event
@@ -150,21 +150,20 @@ local function machine_is_continuous()
   return machine_param == nil or params:get(id("machine")) == 1
 end
 
+-- Header messages auto-expire after ~1s. Expiry is handled by the redraw metro
+-- (see start_redraw_metro) via a timestamp rather than a per-message clock --
+-- rapid encoder edits used to churn clock.run/clock.cancel and could leave a
+-- message stuck on.
 local function show_message(text)
   ui_message = text
-  if ui_message_clock ~= nil then
-    clock.cancel(ui_message_clock)
-  end
-  ui_message_clock = clock.run(function()
-    clock.sleep(1)
-    ui_message = nil
-    ui_message_clock = nil
-    request_redraw()
-  end)
+  ui_message_until = util.time() + 1
   request_redraw()
 end
 
 local function visible_message()
+  if ui_message ~= nil and util.time() >= ui_message_until then
+    return nil
+  end
   return ui_message
 end
 
@@ -185,7 +184,11 @@ local function source_machine_items()
 end
 
 local function source_warp_items()
-  return WarpRegistry.source_items(param_value_or("mode", 1), ParamItem)
+  local items = WarpRegistry.source_items(param_value_or("mode", 1), ParamItem)
+  -- The warp-engine selector leads the WARP page (was buried in settings). It is
+  -- p-lockable -- a step can sequence a different warp engine.
+  table.insert(items, 1, ParamItem.item("mode", "WARP", {lockable = true, options = 6}))
+  return items
 end
 
 local function page_items_for(category, page, page_index)
@@ -324,7 +327,12 @@ local function loop_phase_rate(start_point, end_point)
   local steps = math.max(1, params:get(id("sample_steps")) or 16)
   local loop_beats = math.max(0.03125, (steps / 4) * region)
 
-  if params:get(id("machine")) == 1 then
+  -- Only tape (warp mode 1) drives its phase from pitch + source BPM (varispeed).
+  -- Every other warp mode reads the tempo-locked transport phase, so pitch does
+  -- NOT change its playhead rate -- using source_bpm*pitch there made the visual
+  -- playhead speed up (e.g. PC mode) while the audio stayed put.
+  local mode = params:lookup_param(id("mode")) ~= nil and params:get(id("mode")) or 1
+  if params:get(id("machine")) == 1 and mode == 1 then
     local bpm = status.derived_bpm > 0 and status.derived_bpm or params:get(id("sample_bpm"))
     local pitch_ratio = math.pow(2, (params:get(id("pitch")) or 0) / 12)
     return (bpm / 60 / loop_beats) * pitch_ratio
@@ -597,6 +605,12 @@ local function start_redraw_metro()
   end
 
   redraw_metro = metro.init(function()
+    -- Expire the header message and force one redraw so it clears even when
+    -- stopped (redraw is otherwise gated on redraw_pending).
+    if ui_message ~= nil and util.time() >= ui_message_until then
+      ui_message = nil
+      redraw_pending = true
+    end
     if not browsing and norns.menu.status() == false then
       if playing or redraw_pending then
         redraw_pending = false
@@ -934,10 +948,6 @@ end
 function cleanup()
   if elasticat.flush_dirty_pool_state ~= nil then
     elasticat.flush_dirty_pool_state()
-  end
-  if ui_message_clock ~= nil then
-    clock.cancel(ui_message_clock)
-    ui_message_clock = nil
   end
   if loop_trig_gate_clock ~= nil then
     clock.cancel(loop_trig_gate_clock)

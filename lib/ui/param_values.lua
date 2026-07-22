@@ -152,6 +152,10 @@ function ParamValues:item_long_name(param_item)
     return "velocity"
   elseif param_item.file then
     return "sample"
+  elseif param_item.id == "mode_macro" then
+    -- Use the per-engine label (DUTY/MIX/CHAOS/SMEAR) in messages instead of the
+    -- generic "mode macro" param name.
+    return string.lower(param_item.short or "macro")
   end
 
   local full_id = self:item_param_id(param_item)
@@ -350,7 +354,9 @@ function ParamValues:adjusted_value(param_item, current, delta, snap)
   -- drop to a fine step instead (they get a zoomed view for precision), and
   -- Range snaps to fixed multiples.
   if snap then
-    if param_item.trim_scan then
+    if param_item.trim_scan or param_item.fn_fine then
+      -- FN uses fine_step instead of snapping (trim scan = finer; chop steps =
+      -- coarser 0.25 vs the normal 0.05).
       local step = param_item.fine_step or param_item.step or 1
       return util.clamp(current + (delta * step), param_item.min or current, param_item.max or current)
     elseif param_item.fn_snap_multiple ~= nil then
@@ -460,6 +466,21 @@ function ParamValues:delta_item(param_item, delta)
   end
 
   local lock_id = param_item.lock_id or param_item.id
+
+  -- Slow-option items (e.g. chop LOOP mode) need several detents to advance one
+  -- option, so a small nudge doesn't flip them. Accumulate raw delta and only
+  -- act once it crosses the threshold.
+  if param_item.options ~= nil and param_item.slow_option then
+    self.option_accum = self.option_accum or {}
+    local acc = (self.option_accum[lock_id] or 0) + delta
+    if math.abs(acc) < (param_item.slow_option == true and 3 or param_item.slow_option) then
+      self.option_accum[lock_id] = acc
+      return
+    end
+    self.option_accum[lock_id] = 0
+    delta = acc
+  end
+
   local step_edit = grid_ui ~= nil and grid_ui.screen_edit ~= nil and grid_ui:screen_edit() or nil
   local locking = step_edit ~= nil and param_item.lockable == true
   local current = locking and (grid_ui:held_param_lock(lock_id) or self:item_raw_value(param_item)) or self:item_raw_value(param_item)
