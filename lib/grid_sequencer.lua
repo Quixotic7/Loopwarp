@@ -1773,7 +1773,13 @@ function GridSequencer:redraw()
   end
 
   self.g:all(0)
+  self:draw_normal_leds()
+  self.g:refresh()
+end
 
+-- Draws the full normal control surface (no all(0)/refresh -- caller frames it),
+-- so the visualizer page can render the keys and then overlay the comet sweep.
+function GridSequencer:draw_normal_leds()
   self.g:led(1, 1, self:pressed_level(1, 1, 3))
   self.g:led(3, 1, self:pressed_level(3, 1, self.recording and 12 or 3))
   self.g:led(4, 1, self:pressed_level(4, 1, self.playing and 13 or 4))
@@ -1801,8 +1807,6 @@ function GridSequencer:redraw()
   else
     self:draw_step_row()
   end
-
-  self.g:refresh()
 end
 
 local INTRO_SWEEP_PERIOD = 2.0  -- seconds for one comet sweep across the grid
@@ -1873,8 +1877,9 @@ function GridSequencer:draw_intro(elapsed)
   self.g:refresh()
 end
 
--- Visualizer page: the comet sweep on a loop (no cat), re-randomized each pass.
--- `phase` is the tempo-scaled clock from the coordinator, so sweep speed tracks BPM.
+-- Visualizer page: the normal control surface with the comet sweep layered on
+-- top, looping and re-randomized each pass. `phase` is the tempo-scaled clock
+-- from the coordinator, so sweep speed tracks BPM.
 function GridSequencer:start_sweep_loop()
   math.randomseed(math.floor(util.time() * 1e6) % 2147483647)
   self.sweep_cycle = nil
@@ -1891,7 +1896,8 @@ function GridSequencer:draw_sweep_loop(phase)
     self:roll_intro_bars()
   end
   self.g:all(0)
-  self:draw_sweep_bars(phase - cycle * INTRO_SWEEP_PERIOD, nil)
+  self:draw_normal_leds()  -- the keys you'd normally see
+  self:draw_sweep_bars(phase - cycle * INTRO_SWEEP_PERIOD, nil)  -- comets on top
   self.g:refresh()
 end
 
