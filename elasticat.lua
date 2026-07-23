@@ -22,6 +22,17 @@ local redraw_metro = nil
 local redraw_pending = true
 local grid_ui = nil
 local ui_message = nil
+
+-- Launch intro: a spritesheet logo animation on screen + a grid comet sweep,
+-- played once before the normal UI takes over.
+local logo_image = nil
+local intro_active = false
+local intro_start = 0
+local LOGO_FRAMES = 55
+local LOGO_FPS = 10             -- sprite advances at 10fps (norns screen refreshes ~15Hz)
+local LOGO_FRAME_W = 128
+local LOGO_FRAME_H = 64
+local INTRO_DURATION = LOGO_FRAMES / LOGO_FPS  -- 5.5s: play the spritesheet once
 local ui_message_until = 0
 local loop_trig_gate_clock = nil
 local loop_trig_gate_token = 0
@@ -101,8 +112,8 @@ local function cache_sample_waveform(slot, path)
   sample_waveforms[slot] = WavReader.read_wav_waveform(path, WAVEFORM_BUCKETS) or WavReader.fallback_waveform(path, WAVEFORM_BUCKETS)
 end
 
-local function active_waveform()
-  local slot = elasticat.active_pool_slot ~= nil and elasticat.active_pool_slot() or 1
+local function active_waveform(slot)
+  slot = slot or (elasticat.active_pool_slot ~= nil and elasticat.active_pool_slot()) or 1
   local waveform = sample_waveforms[slot]
   local path = elasticat.pool_path ~= nil and elasticat.pool_path(slot) or nil
   if path == nil or path == "" or path == "-" or path:sub(-1) == "/" then
@@ -324,7 +335,11 @@ local function loop_phase_rate(start_point, end_point)
     eng_start, eng_end = elasticat.map_region(start_point, end_point)
   end
   local region = math.max(0.01, eng_end - eng_start) / 128
-  local steps = math.max(1, params:get(id("sample_steps")) or 16)
+  -- Use the *active* (playback) slot's steps/bpm from the pool, not the sample_*
+  -- params (which now follow the File-editor slot), so the playhead rate matches
+  -- what's playing even while editing another slot.
+  local active_steps = elasticat.active_steps ~= nil and elasticat.active_steps() or params:get(id("sample_steps"))
+  local steps = math.max(1, active_steps or 16)
   local loop_beats = math.max(0.03125, (steps / 4) * region)
 
   -- Only tape (warp mode 1) drives its phase from pitch + source BPM (varispeed).
@@ -333,7 +348,8 @@ local function loop_phase_rate(start_point, end_point)
   -- playhead speed up (e.g. PC mode) while the audio stayed put.
   local mode = params:lookup_param(id("mode")) ~= nil and params:get(id("mode")) or 1
   if params:get(id("machine")) == 1 and mode == 1 then
-    local bpm = status.derived_bpm > 0 and status.derived_bpm or params:get(id("sample_bpm"))
+    local active_bpm = elasticat.active_bpm ~= nil and elasticat.active_bpm() or params:get(id("sample_bpm"))
+    local bpm = status.derived_bpm > 0 and status.derived_bpm or active_bpm
     local pitch_ratio = math.pow(2, (params:get(id("pitch")) or 0) / 12)
     return (bpm / 60 / loop_beats) * pitch_ratio
   end
@@ -565,8 +581,10 @@ local function load_file(path)
   if path ~= "cancel" then
     script_state:save_browser_folder(ScriptState.parent_folder(path))
     if elasticat.load_pool_slot ~= nil then
-      local slot = elasticat.active_pool_slot ~= nil and elasticat.active_pool_slot() or param_value_or("sample_slot", 1)
-      elasticat.load_pool_slot(slot, path, true)
+      -- The browser is opened from the File page, so loads target the file-edit
+      -- slot, not the track's playback slot.
+      local slot = elasticat.file_edit_slot ~= nil and elasticat.file_edit_slot() or param_value_or("file_slot", 1)
+      elasticat.load_pool_slot(slot, path)
     else
       params:set(id("sample"), path)
     end
@@ -599,12 +617,57 @@ select_sample = function()
   end
 end
 
+local function start_intro()
+  local ok, img = pcall(function()
+    return screen.load_png(_path.code .. norns.state.shortname .. "/images/q7logoanim.png")
+  end)
+  logo_image = (ok and img) or nil
+  if grid_ui ~= nil and grid_ui.start_intro ~= nil then
+    grid_ui:start_intro()
+  end
+  intro_start = util.time()
+  intro_active = true
+end
+
+local function draw_intro_screen(elapsed)
+  screen.clear()
+  if logo_image ~= nil then
+    local frame = math.floor(elapsed * LOGO_FPS)
+    frame = util.clamp(frame, 0, LOGO_FRAMES - 1)
+    screen.display_image_region(logo_image, frame * LOGO_FRAME_W, 0, LOGO_FRAME_W, LOGO_FRAME_H, 0, 0)
+  else
+    -- No spritesheet found: keep the launch from being a blank screen.
+    screen.level(15)
+    screen.font_face(1)
+    screen.font_size(16)
+    screen.move(64, 38)
+    screen.text_center("elasticat")
+  end
+  screen.update()
+end
+
 local function start_redraw_metro()
   if redraw_metro ~= nil then
     redraw_metro:stop()
   end
 
   redraw_metro = metro.init(function()
+    -- Play the launch intro (screen logo + grid sweep) before the normal UI.
+    if intro_active then
+      local elapsed = util.time() - intro_start
+      if elapsed < INTRO_DURATION then
+        if not browsing and norns.menu.status() == false then
+          draw_intro_screen(elapsed)
+        end
+        if grid_ui ~= nil and grid_ui.draw_intro ~= nil then
+          grid_ui:draw_intro(elapsed)
+        end
+        return
+      end
+      intro_active = false
+      logo_image = nil
+      redraw_pending = true
+    end
     -- Expire the header message and force one redraw so it clears even when
     -- stopped (redraw is otherwise gated on redraw_pending).
     if ui_message ~= nil and util.time() >= ui_message_until then
@@ -856,6 +919,7 @@ function init()
   end
 
   set_playing(false, true)
+  start_intro()
   start_redraw_metro()
   redraw()
 end
@@ -928,7 +992,7 @@ function enc(n, d)
 end
 
 function redraw()
-  if browsing then
+  if browsing or intro_active then
     return
   end
 

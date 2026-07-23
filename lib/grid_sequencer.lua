@@ -2,6 +2,23 @@ local GridSequencer = {}
 GridSequencer.__index = GridSequencer
 
 local Step = include("lib/sequencer/step")
+local INTRO_CAT_HEX = include("lib/intro_cat_frames")  -- 55 frames of 16x8 grid levels
+local INTRO_CAT_FPS = 10  -- must match the screen logo fps so the two stay in sync
+
+-- Decode the hex frame table into numeric levels once (INTRO_CAT[frame][row][col]).
+local INTRO_CAT = {}
+for f = 1, #INTRO_CAT_HEX do
+  local rows = {}
+  for row = 1, 8 do
+    local cols = {}
+    local hex = INTRO_CAT_HEX[f][row]
+    for x = 1, 16 do
+      cols[x] = tonumber(string.sub(hex, x, x), 16) or 0
+    end
+    rows[row] = cols
+  end
+  INTRO_CAT[f] = rows
+end
 
 local PAGE_MODES = {"select", "loop", "rate"}
 local PAGE_MODE_LABELS = {
@@ -1785,6 +1802,67 @@ function GridSequencer:redraw()
     self:draw_step_row()
   end
 
+  self.g:refresh()
+end
+
+-- Launch intro: 8 horizontal comet bars (one per grid row) that fly in from the
+-- left and exit to the right. Each bar gets a random width, entry delay, and
+-- speed, generated once at intro start; draw_intro renders a frame for the given
+-- elapsed time (seconds). The whole sweep lands within ~2s.
+function GridSequencer:start_intro()
+  math.randomseed(math.floor(util.time() * 1000) % 2147483647)
+  self.intro_bars = {}
+  for row = 1, 8 do
+    local length = math.random(8, 16)        -- bar width in grid columns
+    local delay = math.random() * 0.5        -- staggered entry within 0.5s
+    local cross = 1.0 + math.random() * 0.5  -- 1.0-1.5s to fully cross + exit
+    self.intro_bars[row] = {
+      length = length,
+      delay = delay,
+      speed = (16 + length) / cross          -- columns/sec
+    }
+  end
+end
+
+function GridSequencer:draw_intro(elapsed)
+  if self.g == nil then
+    return
+  end
+  self.g:all(0)
+
+  -- Base layer: the cat spritesheet, advanced at 10fps in sync with the screen
+  -- logo (both keyed off the same elapsed time). Frame is 1-indexed here.
+  local cat_frame = math.floor(elapsed * INTRO_CAT_FPS) + 1
+  if cat_frame < 1 then cat_frame = 1 elseif cat_frame > #INTRO_CAT then cat_frame = #INTRO_CAT end
+  local cat = INTRO_CAT[cat_frame]
+
+  for row = 1, 8 do
+    local bar = self.intro_bars and self.intro_bars[row]
+    local head = nil
+    if bar ~= nil then
+      local local_t = elapsed - bar.delay
+      if local_t > 0 then
+        head = local_t * bar.speed             -- leading edge, moving right
+      end
+    end
+    for x = 1, 16 do
+      -- Top layer: the comet bar. Where it covers a cell it overwrites the cat,
+      -- so the cat is revealed in the bars' wake.
+      local level = 0
+      if head ~= nil then
+        local dist = head - x                  -- columns behind the head
+        if dist >= 0 and dist < bar.length then
+          level = math.floor(15 * (1 - dist / bar.length) + 0.5)
+        end
+      end
+      if level <= 0 and cat ~= nil then
+        level = cat[row][x]
+      end
+      if level > 0 then
+        self.g:led(x, row, level)
+      end
+    end
+  end
   self.g:refresh()
 end
 

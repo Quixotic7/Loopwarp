@@ -42,6 +42,7 @@ local sample_pool = {
   paths = {},
   samples = {},
   rates = {},
+  channels = {},
   bpms = {},
   steps = {},
   trim_starts = {},
@@ -49,7 +50,16 @@ local sample_pool = {
   gains = {}
 }
 local active_sample_slot = 1
+-- The File page edits this slot independently of the track's playback slot
+-- (active_sample_slot). The sample metadata params (bpm/steps/trim/gain/file)
+-- reflect file_edit_slot; playback reads the active slot's pool metadata
+-- directly. Editing only touches the engine when the two slots coincide.
+local file_edit_slot = 1
 local pool_options = {}
+
+local function file_edits_active()
+  return file_edit_slot == active_sample_slot
+end
 local pool_dirty = {}
 local suppress_pool_callback = false
 local engine_call = nil
@@ -348,41 +358,43 @@ local function load_sample_slot(slot, path)
   end
 end
 
-local function apply_slot_metadata(slot)
+-- Push the *active* slot's pool metadata (bpm/steps/trim/gain) to the engine.
+-- Called when the active/playback slot changes, or when its own metadata is
+-- edited. Does not touch the display params -- those follow the file-edit slot.
+local function push_engine_slot_metadata(slot)
   slot = sample_slot_number(slot)
-  local bpm = sample_pool.bpms[slot]
-  local steps = sample_pool.steps[slot]
-  local trim_start = sample_pool.trim_starts[slot]
-  local trim_end = sample_pool.trim_ends[slot]
-  local source_bpm_id = ids.sample_bpm ~= nil and ids.sample_bpm:gsub("sample_bpm$", "source_bpm") or nil
-
-  if bpm ~= nil and params:lookup_param(ids.sample_bpm) ~= nil then
-    params:set(ids.sample_bpm, bpm, true)
-    if source_bpm_id ~= nil and params:lookup_param(source_bpm_id) ~= nil then
-      params:set(source_bpm_id, bpm, true)
-    end
-    engine_call("sourceBpm", bpm)
+  if sample_pool.bpms[slot] ~= nil then
+    engine_call("sourceBpm", sample_pool.bpms[slot])
   end
-
-  if steps ~= nil and params:lookup_param(ids.sample_steps) ~= nil then
-    params:set(ids.sample_steps, steps, true)
-    engine_call("setSampleSteps", steps)
+  if sample_pool.steps[slot] ~= nil then
+    engine_call("setSampleSteps", sample_pool.steps[slot])
   end
+  send_effective_amp()
+  update_engine_loop_points()
+end
 
-  if trim_start ~= nil and ids.trim_start ~= nil and params:lookup_param(ids.trim_start) ~= nil then
-    params:set(ids.trim_start, trim_start, true)
+-- Load the file-edit slot's pool metadata into the display params (silently) so
+-- the File page reflects that slot without disturbing playback.
+local function apply_file_slot_metadata(slot)
+  slot = sample_slot_number(slot)
+  if sample_pool.bpms[slot] ~= nil and params:lookup_param(ids.sample_bpm) ~= nil then
+    params:set(ids.sample_bpm, sample_pool.bpms[slot], true)
   end
-
-  if trim_end ~= nil and ids.trim_end ~= nil and params:lookup_param(ids.trim_end) ~= nil then
-    params:set(ids.trim_end, trim_end, true)
+  if sample_pool.steps[slot] ~= nil and params:lookup_param(ids.sample_steps) ~= nil then
+    params:set(ids.sample_steps, sample_pool.steps[slot], true)
   end
-
+  if sample_pool.trim_starts[slot] ~= nil and ids.trim_start ~= nil and params:lookup_param(ids.trim_start) ~= nil then
+    params:set(ids.trim_start, sample_pool.trim_starts[slot], true)
+  end
+  if sample_pool.trim_ends[slot] ~= nil and ids.trim_end ~= nil and params:lookup_param(ids.trim_end) ~= nil then
+    params:set(ids.trim_end, sample_pool.trim_ends[slot], true)
+  end
   if ids.gain ~= nil and params:lookup_param(ids.gain) ~= nil then
     params:set(ids.gain, sample_pool.gains[slot] or 1, true)
   end
-  send_effective_amp()
-
-  update_engine_loop_points()
+  if ids.sample ~= nil and params:lookup_param(ids.sample) ~= nil then
+    params:set(ids.sample, sample_pool.paths[slot] or _path.audio, true)
+  end
 end
 
 local function sync_sample_file_param(path)
@@ -400,6 +412,8 @@ local function set_active_pool_slot(slot)
   end
   active_sample_slot = slot
 
+  -- sample_slot is the SOURCE-page (track) selector; the File page has its own
+  -- file_slot. We only sync the track selector here.
   if ids.sample_slot ~= nil and params:lookup_param(ids.sample_slot) ~= nil then
     if math.floor((params:get(ids.sample_slot) or 1) + 0.5) ~= slot then
       params:set(ids.sample_slot, slot, true)
@@ -407,7 +421,6 @@ local function set_active_pool_slot(slot)
   end
 
   if slot == 0 then
-    sync_sample_file_param(nil)
     engine_call("setSampleSlot", 0)
     if not suppress_pool_callback and pool_options.on_sample_slot ~= nil then
       pool_options.on_sample_slot(0, nil)
@@ -415,10 +428,30 @@ local function set_active_pool_slot(slot)
     return
   end
 
-  sync_sample_file_param(sample_pool.paths[slot])
-  apply_slot_metadata(slot)
+  -- Push the active slot's metadata to the engine (not the display params, which
+  -- follow the file-edit slot).
+  push_engine_slot_metadata(slot)
   engine_call("setSampleSlot", slot)
 
+  if not suppress_pool_callback and pool_options.on_sample_slot ~= nil then
+    pool_options.on_sample_slot(slot, sample_pool.paths[slot])
+  end
+end
+
+-- Select which slot the File page edits, independent of playback. Loads that
+-- slot's metadata into the display params so the editor reflects it.
+local function set_file_edit_slot(slot)
+  slot = sample_slot_number(slot)
+  if slot ~= file_edit_slot then
+    elasticat.flush_dirty_pool_state()
+  end
+  file_edit_slot = slot
+  if ids.file_slot ~= nil and params:lookup_param(ids.file_slot) ~= nil then
+    if math.floor((params:get(ids.file_slot) or 1) + 0.5) ~= slot then
+      params:set(ids.file_slot, slot, true)
+    end
+  end
+  apply_file_slot_metadata(slot)
   if not suppress_pool_callback and pool_options.on_sample_slot ~= nil then
     pool_options.on_sample_slot(slot, sample_pool.paths[slot])
   end
@@ -644,35 +677,46 @@ function elasticat.set_loop_region(start_point, end_point, reset_playhead)
   end
 end
 
--- Auditions the current sample's *file trim* window (bypassing Range and Track,
--- which is what the File page is for), looping it. Only engages while master
+-- Auditions the File-edit slot as a raw looped sample -- native rate, no
+-- timestretch / pitch / warp -- through its own preview synth (engine
+-- previewSlot), using the slot's trim window and gain. Only while master
 -- transport is stopped so it never fights sequenced playback.
 function elasticat.preview_trim(on)
   if on then
     if ids.play ~= nil and params:get(ids.play) == 1 then
       return
     end
-    local trim_start, trim_end, duration = trim_bounds()
-    local lo, hi = 0, 128
+    local slot = file_edit_slot
+    local trim_start, trim_end, duration = trim_bounds(slot)
+    local start_frac, end_frac = 0, 1
     if duration > 0 then
-      lo = util.clamp((trim_start / duration) * 128, 0, 127.99)
-      hi = util.clamp((trim_end / duration) * 128, lo + 0.01, 128)
+      start_frac = util.clamp(trim_start / duration, 0, 0.999)
+      end_frac = util.clamp(trim_end / duration, start_frac + 0.001, 1)
     end
+    local gain = sample_pool.gains[slot] or 1
     flush_engine_sends()
-    if engine.loopRegionPlayhead ~= nil then
-      engine_call("loopRegionPlayhead", lo, hi, 0)
-    else
-      engine_call("loopStart", lo)
-      engine_call("loopEnd", hi)
-    end
-    elasticat.play(true)
+    engine_call("previewSlot", slot, start_frac, end_frac, gain, 1)
   else
-    elasticat.play(false)
+    engine_call("previewSlot", 0, 0, 1, 1, 0)
   end
 end
 
 function elasticat.active_pool_slot()
   return active_sample_slot
+end
+
+function elasticat.file_edit_slot()
+  return file_edit_slot
+end
+
+-- Active (playback) slot's BPM/steps, read straight from the pool so the visual
+-- playhead rate stays correct even when the File page is editing another slot.
+function elasticat.active_bpm()
+  return sample_pool.bpms[active_sample_slot] or 120
+end
+
+function elasticat.active_steps()
+  return sample_pool.steps[active_sample_slot] or 16
 end
 
 function elasticat.pool_path(slot)
@@ -701,6 +745,7 @@ function elasticat.pool_meta(slot)
     path = sample_pool.paths[slot],
     samples = sample_pool.samples[slot],
     rate = sample_pool.rates[slot],
+    channels = sample_pool.channels[slot],
     bpm = sample_pool.bpms[slot],
     steps = sample_pool.steps[slot],
     trim_start = sample_pool.trim_starts[slot],
@@ -732,9 +777,10 @@ function elasticat.set_pool_slot(slot)
 end
 
 -- Recompute BPM (filename, else keep current) and steps (from duration * bpm)
--- for the active sample slot, applying to the pool + params + engine.
+-- for the File-edit slot, applying to the pool + params (+ engine if it's also
+-- the active slot).
 function elasticat.recalc_bpm_steps()
-  local slot = active_sample_slot
+  local slot = file_edit_slot
   local path = sample_pool.paths[slot]
   local samples = sample_pool.samples[slot] or 0
   local rate = sample_pool.rates[slot] or 0
@@ -746,11 +792,16 @@ function elasticat.recalc_bpm_steps()
   local steps = quantize_steps(duration * bpm / 60 * 4)
   sample_pool.bpms[slot] = bpm
   sample_pool.steps[slot] = steps
+  -- Silent: update the display params (which track the file-edit slot) without
+  -- firing their actions, then push to the engine only if this slot is playing.
   if params:lookup_param(ids.sample_bpm) ~= nil then
-    params:set(ids.sample_bpm, bpm)
+    params:set(ids.sample_bpm, bpm, true)
   end
   if params:lookup_param(ids.sample_steps) ~= nil then
-    params:set(ids.sample_steps, steps)
+    params:set(ids.sample_steps, steps, true)
+  end
+  if file_edits_active() then
+    push_engine_slot_metadata(slot)
   end
   mark_pool_dirty(slot)
 end
@@ -771,8 +822,8 @@ function elasticat.load_pool_slot(slot, path, make_active)
     return false
   end
 
-  local _, samples, rate = audio.file_info(path)
-  print("elasticat: audio.file_info slot=" .. tostring(slot) .. " samples=" .. tostring(samples) .. " rate=" .. tostring(rate))
+  local channels, samples, rate = audio.file_info(path)
+  print("elasticat: audio.file_info slot=" .. tostring(slot) .. " ch=" .. tostring(channels) .. " samples=" .. tostring(samples) .. " rate=" .. tostring(rate))
   if (samples or 0) <= 0 or (rate or 0) <= 0 then
     print("elasticat: not an audio file: " .. path)
     return false
@@ -813,6 +864,7 @@ function elasticat.load_pool_slot(slot, path, make_active)
   sample_pool.paths[slot] = path
   sample_pool.samples[slot] = samples
   sample_pool.rates[slot] = rate
+  sample_pool.channels[slot] = channels
   sample_pool.bpms[slot] = bpm
   sample_pool.steps[slot] = steps
   sample_pool.trim_starts[slot] = trim_start
@@ -825,6 +877,14 @@ function elasticat.load_pool_slot(slot, path, make_active)
 
   flush_engine_sends()
   load_sample_slot(slot, path)
+  -- Refresh the File-page display if this is the edit slot, and re-push metadata
+  -- to the engine if this is the playing slot.
+  if slot == file_edit_slot then
+    apply_file_slot_metadata(slot)
+  end
+  if slot == active_sample_slot then
+    push_engine_slot_metadata(slot)
+  end
   notify_pool_change("load", slot, path)
   return true
 end
@@ -847,8 +907,11 @@ function elasticat.load_pool_paths(paths, selected_slot)
         sample_pool.trim_starts[slot] = tonumber(entry.trim_start) or sample_pool.trim_starts[slot]
         sample_pool.trim_ends[slot] = tonumber(entry.trim_end) or sample_pool.trim_ends[slot]
         sample_pool.gains[slot] = tonumber(entry.gain) or sample_pool.gains[slot]
-        if slot == selected_slot then
-          apply_slot_metadata(slot)
+        if slot == active_sample_slot then
+          push_engine_slot_metadata(slot)
+        end
+        if slot == file_edit_slot then
+          apply_file_slot_metadata(slot)
         end
       end
     end
@@ -872,6 +935,7 @@ function elasticat.params(options)
   ids.target_bpm = param_id(prefix, "target_bpm")
   ids.sample_bpm = param_id(prefix, "sample_bpm")
   ids.sample_steps = param_id(prefix, "sample_steps")
+  ids.file_slot = param_id(prefix, "file_slot")
   ids.bpm_step_mode = param_id(prefix, "bpm_step_mode")
   ids.recalc_bpm_steps = param_id(prefix, "recalc_bpm_steps")
   ids.trim_start = param_id(prefix, "trim_start")
@@ -935,11 +999,20 @@ function elasticat.params(options)
       return v < 1 and "off" or tostring(v)
     end)
 
+  -- File-editor slot: which slot the File page edits, independent of the track's
+  -- playback slot (sample_slot).
+  add_control(ids.file_slot, "file edit slot",
+    cs.new(1, 128, "lin", 1, 1, "", 1 / 127),
+    function(x)
+      set_file_edit_slot(x)
+    end,
+    function(param) return tostring(math.floor(param:get() + 0.5)) end)
+
   params:add_file(ids.sample, "sample", options.sample or _path.audio)
   params:set_action(ids.sample, function(path)
     print("elasticat: sample param action " .. tostring(path))
     if path ~= nil and path ~= "-" and path ~= "" and is_audio_file(path) then
-      if not elasticat.load_pool_slot(active_sample_slot, path, true) then
+      if not elasticat.load_pool_slot(file_edit_slot, path) then
         params:set(ids.sample, _path.audio, true)
       end
     end
@@ -1026,20 +1099,24 @@ function elasticat.params(options)
   add_control(ids.sample_bpm, "sample bpm",
     cs.new(20, 300, "lin", 1, 120, "bpm", 1 / 280),
     function(x)
-      sample_pool.bpms[active_sample_slot] = x
-      if params:lookup_param(param_id(prefix, "source_bpm")) ~= nil then
-        params:set(param_id(prefix, "source_bpm"), x, true)
+      sample_pool.bpms[file_edit_slot] = x
+      mark_pool_dirty(file_edit_slot)
+      if file_edits_active() then
+        if params:lookup_param(param_id(prefix, "source_bpm")) ~= nil then
+          params:set(param_id(prefix, "source_bpm"), x, true)
+        end
+        queue_engine_call(ids.sample_bpm, "sourceBpm", x)
       end
-      mark_pool_dirty(active_sample_slot)
-      queue_engine_call(ids.sample_bpm, "sourceBpm", x)
     end)
 
   add_control(ids.sample_steps, "sample steps",
     cs.new(1, 512, "lin", 1, 16, "", 1 / 511),
     function(x)
-      sample_pool.steps[active_sample_slot] = x
-      mark_pool_dirty(active_sample_slot)
-      queue_engine_call(ids.sample_steps, "setSampleSteps", x)
+      sample_pool.steps[file_edit_slot] = x
+      mark_pool_dirty(file_edit_slot)
+      if file_edits_active() then
+        queue_engine_call(ids.sample_steps, "setSampleSteps", x)
+      end
     end,
     function(param) return tostring(math.floor(param:get() + 0.5)) end)
 
@@ -1059,7 +1136,7 @@ function elasticat.params(options)
   add_control(ids.trim_start, "sample trim start",
     cs.new(0, 3600, "lin", 0.001, 0, "s", 0.001),
     function(x)
-      local slot = active_sample_slot
+      local slot = file_edit_slot
       local prev_start, prev_end, duration = trim_bounds(slot)
       -- Dragging trim start shifts trim end by the same amount, so the
       -- trimmed length stays constant while scrubbing -- unless trim end is
@@ -1079,7 +1156,9 @@ function elasticat.params(options)
       if math.abs(next_end - prev_end) > 0.000001 then
         params:set(ids.trim_end, next_end, true)
       end
-      update_engine_loop_points()
+      if file_edits_active() then
+        update_engine_loop_points()
+      end
       mark_pool_dirty(slot)
     end,
     function(param) return string.format("%.3f s", param:get()) end)
@@ -1087,14 +1166,16 @@ function elasticat.params(options)
   add_control(ids.trim_end, "sample trim end",
     cs.new(0, 3600, "lin", 0.001, 0, "s", 0.001),
     function(x)
-      local slot = active_sample_slot
+      local slot = file_edit_slot
       local trim_start, _, duration = trim_bounds(slot)
       local next_end = util.clamp(x, math.min(duration, trim_start + 0.001), duration)
       sample_pool.trim_ends[slot] = next_end
       if math.abs(next_end - x) > 0.000001 then
         params:set(ids.trim_end, next_end, true)
       end
-      update_engine_loop_points()
+      if file_edits_active() then
+        update_engine_loop_points()
+      end
       mark_pool_dirty(slot)
     end,
     function(param) return string.format("%.3f s", param:get()) end)
@@ -1102,9 +1183,11 @@ function elasticat.params(options)
   add_control(ids.gain, "sample gain",
     cs.new(0, 4, "lin", 0.01, 1, "x", 0.005),
     function(x)
-      local slot = active_sample_slot
+      local slot = file_edit_slot
       sample_pool.gains[slot] = x
-      send_effective_amp()
+      if file_edits_active() then
+        send_effective_amp()
+      end
       mark_pool_dirty(slot)
     end,
     function(param) return string.format("%.2fx", param:get()) end)

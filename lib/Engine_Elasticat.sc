@@ -12,6 +12,7 @@ Engine_Elasticat : CroneEngine {
 
 	var <transportSynth;
 	var <activeSynth;
+	var previewSynth;
 	var <bufL;
 	var <bufR;
 	var <defaultBufL;
@@ -201,6 +202,25 @@ Engine_Elasticat : CroneEngine {
 				correction,
 				targetBpm
 			]);
+		}).add;
+
+		// Sample preview: plays a slot's trim window at native rate, looping, with
+		// no timestretch / pitch / warp -- the File-page audition. Independent of
+		// the transport and mode synths.
+		SynthDef(\elasticatPreview, {
+			arg out=0, bufL=0, bufR=0, startFrac=0, endFrac=1, gain=1, gate=1;
+			var frames, span, phase, pos, sig, env;
+			frames = BufFrames.kr(bufL).max(4);
+			span = (endFrac - startFrac).clip(0.0001, 1);
+			phase = Phasor.ar(0, BufRateScale.kr(bufL) / (frames * span), 0, 1);
+			pos = (startFrac + (phase * span)) * (frames - 1);
+			sig = [
+				BufRd.ar(1, bufL, pos, loop: 1, interpolation: 4),
+				BufRd.ar(1, bufR, pos, loop: 1, interpolation: 4)
+			];
+			env = EnvGen.kr(Env.asr(0.005, 1, 0.02), gate, doneAction: 2);
+			sig = sig * gain.max(0) * env;
+			Out.ar(out, LeakDC.ar(sig));
 		}).add;
 
 		this.addDirectReaderDef(\elasticatTape, 0);
@@ -484,6 +504,7 @@ Engine_Elasticat : CroneEngine {
 		this.addCommand(\loadPoolSlot, "is", { arg msg; this.loadPoolSlot(msg[1], msg[2]); });
 		this.addCommand(\setSampleSlot, "i", { arg msg; this.setSampleSlot(msg[1]); });
 		this.addCommand(\sampleSlot, "i", { arg msg; this.setSampleSlot(msg[1]); });
+		this.addCommand(\previewSlot, "iffff", { arg msg; this.previewSlot(msg[1], msg[2], msg[3], msg[4], msg[5]); });
 		this.addCommand(\play, "i", { arg msg; this.play(msg[1]); });
 		this.addCommand(\pause, "", { this.play(0); });
 		this.addCommand(\stopAndReset, "", { this.stopAndReset; });
@@ -1062,6 +1083,26 @@ Engine_Elasticat : CroneEngine {
 		]);
 	}
 
+	previewSlot { arg slot, startFrac, endFrac, gain, on;
+		var idx;
+		if(previewSynth.notNil, {
+			previewSynth.set(\gate, 0);
+			previewSynth = nil;
+		});
+		slot = slot.asInteger;
+		idx = slot.clip(1, poolSize) - 1;
+		if(on > 0.5 and: { slot >= 1 } and: { poolLoaded[idx] == 1 } and: { poolBufL[idx].notNil }, {
+			previewSynth = Synth.tail(context.xg, \elasticatPreview, [
+				\out, context.out_b.index,
+				\bufL, poolBufL[idx].bufnum,
+				\bufR, (poolBufR[idx] ? poolBufL[idx]).bufnum,
+				\startFrac, startFrac.clip(0, 0.999),
+				\endFrac, endFrac.clip(0.001, 1),
+				\gain, gain.max(0)
+			]);
+		});
+	}
+
 	recalculateNativeTempo {
 		var duration;
 		duration = sourceFrames.max(1) / sourceRate.max(1);
@@ -1098,6 +1139,7 @@ Engine_Elasticat : CroneEngine {
 		this.releaseAllSlices;
 		if(statusResponder.notNil, { statusResponder.free; });
 		if(transportResponder.notNil, { transportResponder.free; });
+		if(previewSynth.notNil, { previewSynth.free; });
 		if(activeSynth.notNil, { activeSynth.free; });
 		if(transportSynth.notNil, { transportSynth.free; });
 		if(poolBufL.notNil, {

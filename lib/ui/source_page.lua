@@ -134,7 +134,7 @@ function SourcePage:draw_main_cell(param_item, index, corner)
     return
   elseif param_item.id == "pitch" then
     self:draw_pitch_ruler(param_item, x, y, locked)
-  elseif param_item.id == "sample_slot" then
+  elseif param_item.id == "sample_slot" or param_item.id == "file_slot" then
     self:draw_sample_slot_tab(param_item, x, y, locked)
   else
     -- Show the value when flashing/locked, when the item asks to always show it
@@ -212,8 +212,10 @@ function SourcePage:draw_waveform(opts)
   local width = opts.width or 122
   local height = opts.height or 22
   local center = y0 + math.floor(height / 2)
-  local waveform = self.active_waveform()
-  local slot = self.elasticat.active_pool_slot ~= nil and self.elasticat.active_pool_slot() or 1
+  -- opts.slot lets the File page render its own (file-edit) slot; otherwise the
+  -- active/playback slot.
+  local slot = opts.slot or (self.elasticat.active_pool_slot ~= nil and self.elasticat.active_pool_slot()) or 1
+  local waveform = self.active_waveform(slot)
   local meta = self.elasticat.pool_meta ~= nil and self.elasticat.pool_meta(slot) or {}
   local duration = meta.duration or 0
   local trim_start = meta.trim_start or 0
@@ -359,6 +361,16 @@ function SourcePage:draw_waveform(opts)
       self:draw_waveform_marker(position, x0, y0, width, height, nil)
     end
   end
+
+  -- Stereo / mono badge (top-left of the waveform box).
+  if meta.channels ~= nil then
+    screen.level(0)
+    screen.rect(x0 + 1, y0 + 1, 11, 7)
+    screen.fill()
+    screen.level(9)
+    screen.move(x0 + 2, y0 + 7)
+    screen.text(meta.channels >= 2 and "ST" or "MO")
+  end
 end
 
 -- Draws param cells for the K2/K3 group model, rendered at cell positions
@@ -393,7 +405,8 @@ function SourcePage:draw_editor(opts)
     height = SOURCE_WAVEFORM_HEIGHT,
     show_slices = opts.show_slices,
     sample_edit = opts.sample_edit,
-    range_edit = opts.range_edit
+    range_edit = opts.range_edit,
+    slot = opts.slot
   })
   self:draw_editor_cells(opts.items, opts.cell_offset)
 end
@@ -409,12 +422,15 @@ function SourcePage:draw_main_page(items, page_number)
 end
 
 function SourcePage:draw_file_page(page, items)
-  local slot = self.elasticat.active_pool_slot ~= nil and self.elasticat.active_pool_slot() or self.param_value_or("sample_slot", 1)
+  -- The File page edits its own file-edit slot, independent of playback.
+  local slot = self.elasticat.file_edit_slot ~= nil and self.elasticat.file_edit_slot() or self.param_value_or("file_slot", 1)
+  local name = self.elasticat.pool_label ~= nil and self.elasticat.pool_label(slot) or self.sample_name()
   self:draw_editor({
     items = items,
     page_number = self.nav.page_index_by_category.file or 1,
-    title = string.format("%03d %s", slot, self.sample_name()),
-    sample_edit = true
+    title = string.format("%03d %s", slot, name),
+    sample_edit = true,
+    slot = slot
   })
 end
 
