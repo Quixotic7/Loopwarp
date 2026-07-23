@@ -12,6 +12,13 @@ local page_model = {
           item("target_bpm", "BPM", {lockable = false, min = 20, max = 300, step = 1, snaps = {60, 80, 90, 100, 110, 120, 128, 136, 140, 160, 180}}),
           item("amp", "VOL", {lockable = true, min = 0, max = 2, step = 0.01, snaps = {0, 0.25, 0.5, 0.75, 0.8, 1, 1.25, 1.5, 2}})
         }
+      },
+      {
+        -- Full-screen looping sprite + grid comet sweep, tempo-scaled. The
+        -- coordinator detects `animation` and renders it with no header/UI.
+        title = "VISUALIZER",
+        items = {},
+        animation = true
       }
     },
     settings = {

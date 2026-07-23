@@ -1805,12 +1805,12 @@ function GridSequencer:redraw()
   self.g:refresh()
 end
 
--- Launch intro: 8 horizontal comet bars (one per grid row) that fly in from the
--- left and exit to the right. Each bar gets a random width, entry delay, and
--- speed, generated once at intro start; draw_intro renders a frame for the given
--- elapsed time (seconds). The whole sweep lands within ~2s.
-function GridSequencer:start_intro()
-  math.randomseed(math.floor(util.time() * 1000) % 2147483647)
+local INTRO_SWEEP_PERIOD = 2.0  -- seconds for one comet sweep across the grid
+
+-- Randomize the 8 comet bars (one per grid row): each gets a random width, entry
+-- delay, and speed so the sweep flies in from the left and exits within ~2s.
+-- (Caller seeds the RNG once at start; we don't reseed per roll.)
+function GridSequencer:roll_intro_bars()
   self.intro_bars = {}
   for row = 1, 8 do
     local length = math.random(8, 16)        -- bar width in grid columns
@@ -1824,30 +1824,20 @@ function GridSequencer:start_intro()
   end
 end
 
-function GridSequencer:draw_intro(elapsed)
-  if self.g == nil then
-    return
-  end
-  self.g:all(0)
-
-  -- Base layer: the cat spritesheet, advanced at 10fps in sync with the screen
-  -- logo (both keyed off the same elapsed time). Frame is 1-indexed here.
-  local cat_frame = math.floor(elapsed * INTRO_CAT_FPS) + 1
-  if cat_frame < 1 then cat_frame = 1 elseif cat_frame > #INTRO_CAT then cat_frame = #INTRO_CAT end
-  local cat = INTRO_CAT[cat_frame]
-
+-- Draw the comet bars for local sweep time `t`, compositing over an optional cat
+-- base frame (INTRO_CAT row/col levels). Where a bar covers a cell it overwrites
+-- the base, so the base is revealed in the bars' wake. Caller does all(0)/refresh.
+function GridSequencer:draw_sweep_bars(t, cat)
   for row = 1, 8 do
     local bar = self.intro_bars and self.intro_bars[row]
     local head = nil
     if bar ~= nil then
-      local local_t = elapsed - bar.delay
+      local local_t = t - bar.delay
       if local_t > 0 then
         head = local_t * bar.speed             -- leading edge, moving right
       end
     end
     for x = 1, 16 do
-      -- Top layer: the comet bar. Where it covers a cell it overwrites the cat,
-      -- so the cat is revealed in the bars' wake.
       local level = 0
       if head ~= nil then
         local dist = head - x                  -- columns behind the head
@@ -1863,6 +1853,45 @@ function GridSequencer:draw_intro(elapsed)
       end
     end
   end
+end
+
+-- Launch intro: comet sweep over the cat spritesheet (10fps, synced to the
+-- screen logo via the same elapsed clock). One-shot; bars exit by ~2s.
+function GridSequencer:start_intro()
+  math.randomseed(math.floor(util.time() * 1e6) % 2147483647)
+  self:roll_intro_bars()
+end
+
+function GridSequencer:draw_intro(elapsed)
+  if self.g == nil then
+    return
+  end
+  self.g:all(0)
+  local cat_frame = math.floor(elapsed * INTRO_CAT_FPS) + 1  -- 1-indexed
+  if cat_frame < 1 then cat_frame = 1 elseif cat_frame > #INTRO_CAT then cat_frame = #INTRO_CAT end
+  self:draw_sweep_bars(elapsed, INTRO_CAT[cat_frame])
+  self.g:refresh()
+end
+
+-- Visualizer page: the comet sweep on a loop (no cat), re-randomized each pass.
+-- `phase` is the tempo-scaled clock from the coordinator, so sweep speed tracks BPM.
+function GridSequencer:start_sweep_loop()
+  math.randomseed(math.floor(util.time() * 1e6) % 2147483647)
+  self.sweep_cycle = nil
+  self:roll_intro_bars()
+end
+
+function GridSequencer:draw_sweep_loop(phase)
+  if self.g == nil then
+    return
+  end
+  local cycle = math.floor(phase / INTRO_SWEEP_PERIOD)
+  if cycle ~= self.sweep_cycle then
+    self.sweep_cycle = cycle
+    self:roll_intro_bars()
+  end
+  self.g:all(0)
+  self:draw_sweep_bars(phase - cycle * INTRO_SWEEP_PERIOD, nil)
   self.g:refresh()
 end
 

@@ -33,6 +33,18 @@ local LOGO_FPS = 10             -- sprite advances at 10fps (norns screen refres
 local LOGO_FRAME_W = 128
 local LOGO_FRAME_H = 64
 local INTRO_DURATION = LOGO_FRAMES / LOGO_FPS  -- 5.5s: play the spritesheet once
+
+-- Visualizer page (master category): a looping full-screen sprite + grid comet
+-- sweep, both with playback speed scaled by tempo (120 BPM = 1x).
+local dancing_image = nil
+local anim_running = false
+local anim_phase = 0            -- BPM-scaled seconds, drives both sprite + grid sweep
+local anim_last = 0
+local DANCE_FRAMES = 12
+local DANCE_FPS = 10
+local DANCE_FRAME_W = 128
+local DANCE_FRAME_H = 64
+local draw_visualizer_page  -- forward decl: draw_root_page (above) calls it
 local ui_message_until = 0
 local loop_trig_gate_clock = nil
 local loop_trig_gate_token = 0
@@ -447,6 +459,12 @@ local source_page = SourcePage.new({
 local function draw_root_page()
   local page, page_index, model = nav:current_page()
   local title = page.title or model.title or "ELASTICAT"
+
+  if page.animation then
+    draw_visualizer_page()  -- full-screen looping sprite, no header/UI
+    return
+  end
+
   local items = page_items_for(nav:current_category(), page, page_index)
 
   if nav:current_category() == "file" then
@@ -617,16 +635,60 @@ select_sample = function()
   end
 end
 
+local function image_path(name)
+  return _path.code .. norns.state.shortname .. "/images/" .. name
+end
+
 local function start_intro()
   local ok, img = pcall(function()
-    return screen.load_png(_path.code .. norns.state.shortname .. "/images/q7logoanim.png")
+    return screen.load_png(image_path("q7logoanim.png"))
   end)
   logo_image = (ok and img) or nil
+  local ok2, dance = pcall(function()
+    return screen.load_png(image_path("dancingcat.png"))
+  end)
+  dancing_image = (ok2 and dance) or nil
   if grid_ui ~= nil and grid_ui.start_intro ~= nil then
     grid_ui:start_intro()
   end
   intro_start = util.time()
   intro_active = true
+end
+
+-- True while the visualizer page is the active view (no settings, no browser).
+local function on_visualizer_page()
+  if nav.settings_layer or browsing then
+    return false
+  end
+  local page = nav:current_page()
+  return page ~= nil and page.animation == true
+end
+
+-- Advance the tempo-scaled animation clock and return the current phase. Called
+-- once per redraw-metro tick while the visualizer page is showing.
+local function advance_anim_phase()
+  local now = util.time()
+  if not anim_running then
+    anim_running = true
+    anim_phase = 0
+    anim_last = now
+    if grid_ui ~= nil and grid_ui.start_sweep_loop ~= nil then
+      grid_ui:start_sweep_loop()
+    end
+  end
+  local dt = util.clamp(now - anim_last, 0, 0.25)
+  anim_last = now
+  local bpm = params:get(id("target_bpm")) or 120
+  anim_phase = anim_phase + dt * (bpm / 120)  -- 120 BPM = 1x speed
+  return anim_phase
+end
+
+draw_visualizer_page = function()
+  if dancing_image == nil then
+    return
+  end
+  local frame = math.floor(anim_phase * DANCE_FPS) % DANCE_FRAMES
+  screen.display_image_region(dancing_image, frame * DANCE_FRAME_W, 0, DANCE_FRAME_W, DANCE_FRAME_H, 0, 0)
 end
 
 local function draw_intro_screen(elapsed)
@@ -666,6 +728,20 @@ local function start_redraw_metro()
       end
       intro_active = false
       logo_image = nil
+      redraw_pending = true
+    end
+    -- Visualizer page: drive the tempo-scaled sprite + looping grid sweep,
+    -- redrawing every frame and taking over the grid (its key handler still
+    -- works, so the encoders/grid can navigate away).
+    if on_visualizer_page() and norns.menu.status() == false then
+      advance_anim_phase()
+      redraw()
+      if grid_ui ~= nil and grid_ui.draw_sweep_loop ~= nil then
+        grid_ui:draw_sweep_loop(anim_phase)
+      end
+      return
+    elseif anim_running then
+      anim_running = false
       redraw_pending = true
     end
     -- Expire the header message and force one redraw so it clears even when
