@@ -282,6 +282,15 @@ function GridSequencer:first_held_step()
   return nil
 end
 
+function GridSequencer:pattern_has_trigs()
+  for _, record in pairs(self.steps) do
+    if record ~= nil and record.trig == true then
+      return true
+    end
+  end
+  return false
+end
+
 function GridSequencer:held_step_index()
   local step = self:first_held_step()
   if step == nil then
@@ -445,6 +454,33 @@ function GridSequencer:reset_active(record, reset_id)
   return true
 end
 
+-- Trig Jump for a step (per-step lock, else the global default, else on).
+function GridSequencer:trig_jump_active(record)
+  local locks = record ~= nil and record.param_locks or nil
+  if locks ~= nil and locks.trig_jump ~= nil then
+    return locks.trig_jump == 1
+  end
+  if self.options.get_trig_jump ~= nil then
+    return self.options.get_trig_jump() == true
+  end
+  return true
+end
+
+-- Trig Release for a step (per-step lock, else the global trig_release param).
+-- 1=Return (default -- the main loop stays perfectly synced through step
+-- overrides), 2=Boomerang, 3=Reset.
+function GridSequencer:step_release_mode(record)
+  local locks = record ~= nil and record.param_locks or nil
+  local raw = locks ~= nil and locks.trig_release or nil
+  if raw == nil and self.options.get_trig_release ~= nil then
+    raw = self.options.get_trig_release()
+  end
+  raw = math.floor((tonumber(raw) or 1) + 0.5)
+  if raw == 2 then return "boomerang" end
+  if raw == 3 then return "reset" end
+  return "return"
+end
+
 -- Ghost triggers are derived (not a stored flag): a trig that resets nothing --
 -- no start reset (loop_start lock) and env/LFO/filter resets all off. So a step
 -- becomes ghost by clearing its start lock and turning its resets off, and back
@@ -476,11 +512,10 @@ function GridSequencer:toggle_step(page, step)
   record.trig = true
   if is_slice_machine(self:machine()) then
     record.slices[self:slice_index()] = true
-  else
-    -- Loop machines: a normal trigger resets start to 0 (the non-ghost default).
-    record.param_locks = record.param_locks or {}
-    record.param_locks.loop_start = 0
   end
+  -- Loop machines: a plain trigger fires the amp envelope (note_on) but does NOT
+  -- move the playhead -- the loop keeps playing. Only an explicit start/end lock
+  -- repositions it (governed by Trig Jump).
   self:message(string.format("Step %02d Trig", step))
 end
 
@@ -492,7 +527,6 @@ function GridSequencer:toggle_ghost_step(page, step)
   record.trig = true
   record.param_locks = record.param_locks or {}
   if self:is_ghost(record) then
-    record.param_locks.loop_start = 0
     record.param_locks.env_reset = nil
     record.param_locks.lfo_reset = nil
     record.param_locks.filter_reset = nil
@@ -563,12 +597,53 @@ function GridSequencer:set_held_param_lock(param_id, value)
     end
   end
   if did_lock then
-    -- If we're previewing a held step while stopped, re-apply its range/region/
-    -- pitch live so edits (e.g. range start/end) are heard immediately without
-    -- re-pressing the step.
-    self:refresh_preview_region()
+    -- Re-apply the sounding hold (stopped preview OR live-held step) so edits
+    -- like pitch/range are heard immediately without re-pressing the step.
+    self:refresh_held_step()
   end
   return did_lock
+end
+
+-- Re-apply the currently-sounding held step after a lock edit, whichever form
+-- that hold takes: the stopped step preview, or a live-held step (Live Step
+-- Trig) during playback.
+function GridSequencer:refresh_held_step()
+  if self.live_step_hold then
+    self:refresh_live_step()
+  else
+    self:refresh_preview_region()
+  end
+end
+
+-- Live Step Trig: re-apply the held step's locks/pitch/range (and follow its
+-- region locks) so edits made while holding are heard immediately, without
+-- releasing and re-pressing the step.
+function GridSequencer:refresh_live_step()
+  if not self.live_step_hold or self.live_step_index == nil then
+    return
+  end
+  local record = self:step_record(self:step_index(self.selected_page, self.live_step_index), false)
+  if record == nil then
+    return
+  end
+  if self.options.apply_step_param_locks ~= nil then
+    self.options.apply_step_param_locks(self:effective_param_locks(record))
+  end
+  -- Re-pin: effective_param_locks re-added this step's locks with a
+  -- note-length expiry, but a live hold lasts until release.
+  for lock_id in pairs(record.param_locks or {}) do
+    if self.param_lock_holds[lock_id] ~= nil then
+      self.param_lock_holds[lock_id].expires_at = math.huge
+    end
+  end
+  self:apply_step_pitch(record)
+  self:apply_active_range()
+  local locks = record.param_locks or {}
+  if locks.loop_start ~= nil or locks.loop_end ~= nil then
+    -- Follow region edits without re-jumping the phase (live scrub feel).
+    local start_point, end_point = self:resolve_active_region()
+    self:set_region(start_point, end_point)
+  end
 end
 
 -- Re-apply the currently-previewed step's range, region and pitch so lock edits
@@ -800,12 +875,11 @@ end
 
 function GridSequencer:resolve_active_region()
   local track_start, track_end, seq, keys = self:region_layers()
-  local order
-  if self:live_performance_mode() then
-    order = {keys, seq}
-  else
-    order = {seq, keys}
-  end
+  -- Held loop keys are a live gesture and always beat the sequenced layer.
+  -- (Previously seq won outside live-performance mode, so pressing a key while a
+  -- step's region lock was active did nothing -- the region resolved to the
+  -- lock's [0,...] and the whole loop row lit up as if key 1 were held.)
+  local order = {keys, seq}
 
   local start_point, end_point = track_start, track_end
   local start_set, end_set = false, false
@@ -882,6 +956,25 @@ function GridSequencer:set_region_preserve_position(new_start, new_end)
   self:set_region_with_phase(new_start, new_end, phase)
 end
 
+-- Trig Jump OFF: the region walls moved. If the walls didn't actually move,
+-- do nothing at all (no engine reset -- a per-trig phase "correction" would
+-- audibly jitter). If the playhead is still between the new walls, keep walking
+-- (preserve absolute position); if a wall has passed it, warp to the start wall.
+-- Returns true when the region actually changed (the main loop was interrupted).
+function GridSequencer:set_region_within_or_warp(new_start, new_end)
+  if self:region_is_current(new_start, new_end) then
+    return false
+  end
+  local pos = self:current_absolute_position()
+  local lo, hi = math.min(new_start, new_end), math.max(new_start, new_end)
+  if pos ~= nil and pos >= lo and pos <= hi then
+    self:set_region_preserve_position(new_start, new_end)
+  else
+    self:set_region_with_phase(new_start, new_end, 0)
+  end
+  return true
+end
+
 function GridSequencer:slice_range(slice)
   if self.options.get_slice_range ~= nil then
     return self.options.get_slice_range(slice)
@@ -937,7 +1030,16 @@ function GridSequencer:enter_step(reset_sequence)
 
   if reset_sequence then
     self:clear_param_lock_holds()
+    self.seq_anchor = nil
+    self.keys_anchor = nil
   end
+
+  -- Live Step Trig: a live-held step owns playback -- sequenced steps advance
+  -- silently until the hold releases.
+  if self.live_step_hold and not reset_sequence then
+    return
+  end
+
   -- Monophonic: a fresh non-ghost trigger ends the previous note -- clear the
   -- carried holds so unlocked params revert to base before this step's locks
   -- apply. Without this, a step's lock outlives its note-length window when the
@@ -955,6 +1057,15 @@ function GridSequencer:enter_step(reset_sequence)
   -- correct (Actual) range in the same tick.
   self:apply_active_range()
 
+  -- Retrigger the amp envelope on each non-ghost note (ghosts leave the envelope
+  -- untouched -- the env_reset semantics). Empty steps send nothing, so the
+  -- envelope decays to silence between triggers.
+  if (machine == MACHINE_LOOP or machine == MACHINE_LOOP_TRIG)
+    and record ~= nil and record.trig == true and not self:is_ghost(record)
+    and self.options.note_on ~= nil then
+    self.options.note_on(self:note_seconds(record))
+  end
+
   if machine == MACHINE_LOOP then
     -- A step that carries an explicit region lock jumps the playhead to the new
     -- active start (fresh trigger). Every other step re-resolves the layered
@@ -966,11 +1077,44 @@ function GridSequencer:enter_step(reset_sequence)
       local start_point, end_point = self:resolve_active_region()
       self:set_region_with_phase(start_point, end_point, 0)
     elseif record ~= nil and record.trig and record_locks_region then
+      -- A step that locks start/end repositions the playhead. Trig Jump on = warp
+      -- to the region start; off = only reposition if the playhead is now outside
+      -- the new region, otherwise keep playing (the wall/street model).
+      -- If the step actually interrupts the main loop, arm the release anchor
+      -- (kept from the FIRST takeover across chained region steps) so its Trig
+      -- Release mode knows where the main loop would naturally be.
       local start_point, end_point = self:resolve_active_region()
-      self:set_region_with_phase(start_point, end_point, 0)
+      local pending_anchor = self.seq_anchor == nil and self:make_anchor() or nil
+      local interrupted
+      if self:trig_jump_active(record) then
+        self:set_region_with_phase(start_point, end_point, 0)
+        interrupted = true
+      else
+        interrupted = self:set_region_within_or_warp(start_point, end_point)
+      end
+      if interrupted then
+        if self.seq_anchor == nil then
+          self.seq_anchor = pending_anchor
+        end
+        self.seq_release_mode = self:step_release_mode(record)
+      end
     else
       local start_point, end_point = self:resolve_active_region()
-      self:set_region(start_point, end_point)
+      local region_hold = self.param_lock_holds.loop_start ~= nil
+        or self.param_lock_holds.loop_end ~= nil
+      if self.seq_anchor ~= nil and not region_hold and not any_keys(self.loop_holds) then
+        -- The armed region override is gone -- its window expired (possibly
+        -- silently inside effective_param_locks/apply_active_range above, whose
+        -- fresh util.time() can cross the deadline the tick check just missed)
+        -- or a plain mono trigger ended it. Release per the expiring step's
+        -- Trig Release mode instead of a plain set_region, which would leave
+        -- the phasor's 0-1 phase to be reinterpreted in the wider region (the
+        -- "random position" jump).
+        self:apply_release_mode(self.seq_release_mode or "return", start_point, end_point, self.seq_anchor)
+        self.seq_anchor = nil
+      else
+        self:set_region(start_point, end_point)
+      end
     end
   elseif machine == MACHINE_LOOP_TRIG then
     if record ~= nil and record.trig then
@@ -999,6 +1143,12 @@ function GridSequencer:start_sequence(reset_sequence)
     self.play_index = 1
     self:sync_play_page_step()
     self:enter_step(true)
+    -- If the pattern has no trigs at all, fire the amp envelope once at start so
+    -- the loop voice drones (with the default INF hold) without needing steps.
+    if not is_slice_machine(self:machine()) and not self:pattern_has_trigs()
+      and self.options.note_on ~= nil then
+      self.options.note_on(self:note_seconds(nil))
+    end
     self.next_step_time = util.time() + self:step_seconds()
   end
   local seq_metro = self:ensure_sequence_metro()
@@ -1030,6 +1180,10 @@ function GridSequencer:stop_sequence()
   end
   self.next_step_time = nil
   self.seq_remaining_time = nil
+  self.live_step_hold = false
+  self.live_step_index = nil
+  self.seq_anchor = nil
+  self.keys_anchor = nil
   self.play_index = 1
   self:sync_play_page_step()
   self:clear_param_lock_holds()
@@ -1069,17 +1223,35 @@ function GridSequencer:tick_sequence()
     self.next_step_time = now + self:step_seconds()
   end
 
+  local had_region_hold = self.param_lock_holds.loop_start ~= nil
+    or self.param_lock_holds.loop_end ~= nil
   if self:expire_param_lock_holds(now) then
     if self.options.apply_step_param_locks ~= nil then
       self.options.apply_step_param_locks(self:effective_param_locks(nil))
     end
     -- A region/range lock that just expired (note-length window elapsed) means
     -- the active region/range should revert to whatever the remaining layers
-    -- resolve to, without disturbing the playhead position.
+    -- resolve to.
     self:apply_active_range()
     if self:machine() == MACHINE_LOOP then
+      local region_hold = self.param_lock_holds.loop_start ~= nil
+        or self.param_lock_holds.loop_end ~= nil
       local start_point, end_point = self:resolve_active_region()
-      self:set_region(start_point, end_point)
+      if had_region_hold and not region_hold and self.seq_anchor ~= nil
+        and not self.live_step_hold and not any_keys(self.loop_holds) then
+        -- The region-locking step's window elapsed: the playhead returns to the
+        -- main loop per the step's Trig Release mode (Return keeps the main
+        -- loop perfectly synced through step overrides).
+        self:apply_release_mode(self.seq_release_mode or "return", start_point, end_point, self.seq_anchor)
+        self.seq_anchor = nil
+      else
+        self:set_region(start_point, end_point)
+        if not region_hold and not self.live_step_hold and self.seq_anchor ~= nil then
+          -- Override ended while live keys were held: the keys' own release
+          -- logic owns the playhead from here.
+          self.seq_anchor = nil
+        end
+      end
     end
   end
 
@@ -1450,6 +1622,11 @@ function GridSequencer:update_preview_state()
   if should_preview and not self.preview_active then
     self.preview_active = true
     self.options.play(true)
+    -- Open the amp envelope so the preview is audible even with a release/finite
+    -- hold. A long gate keeps it sustained while held; play(false) mutes on release.
+    if not is_slice_machine(self:machine()) and self.options.note_on ~= nil then
+      self.options.note_on(3600)
+    end
   elseif not should_preview and self.preview_active then
     self.preview_active = false
     self.options.play(false)
@@ -1466,29 +1643,17 @@ function GridSequencer:playhead_return_mode()
   return "boomerang"
 end
 
--- Whether a loop-key *press* should jump the playhead to the new region start.
--- Only when the keys layer actually wins the start of the resolved region: in
--- performance mode keys always win; otherwise they only win when no sequenced
--- step is currently holding the region.
-function GridSequencer:loop_keys_win_start()
-  if not self.playing then
-    return true
-  end
-  if self:live_performance_mode() then
-    return true
-  end
-  return not self:step_trigger_active()
-end
-
--- Apply the loop-key layer to the active region. On a fresh press that wins the
--- start we audition-jump to it; while stopped we drive playback directly.
+-- Apply the loop-key layer to the active region. Held keys always win the
+-- region (live gesture beats the sequenced layer), so a fresh press always
+-- audition-jumps to the new region start; while stopped it drives playback
+-- directly.
 function GridSequencer:apply_loop_key_region(is_press)
   local key_start = select(1, self:loop_region_from_holds(self.loop_holds))
   local start_point, end_point = self:resolve_active_region()
 
   if key_start ~= nil then
     self.manual_region = { start_point = start_point, end_point = end_point }
-    if is_press and self:loop_keys_win_start() then
+    if is_press then
       self:set_region_with_phase(start_point, end_point, 0)
     else
       self:set_region(start_point, end_point)
@@ -1504,37 +1669,171 @@ function GridSequencer:apply_loop_key_region(is_press)
   end
 end
 
--- The last live loop key was released during playback. The playhead-return mode
--- decides where the playhead lands in the region the sequencer/track resolve to.
-function GridSequencer:apply_loop_release_playhead(start_point, end_point)
-  local mode = self:playhead_return_mode()
+-- Snapshot of where the playhead is (and the region it's in) at the moment an
+-- override begins -- a live loop-key performance, a region-locking step, or a
+-- live-held step. Return mode later uses it to land where the main loop would
+-- naturally be if the override never happened.
+function GridSequencer:make_anchor()
+  return {
+    start_point = self.current_region_start,
+    end_point = self.current_region_end,
+    pos = self:current_absolute_position(),
+    time = util.time()
+  }
+end
+
+-- The anchor position advanced at the anchored region's own rate: where the
+-- main loop would be now had it just kept playing. nil when unavailable.
+-- (Assumes the anchored region's rate didn't change during the override.)
+function GridSequencer:natural_phase_from(anchor)
+  if anchor == nil or anchor.pos == nil or anchor.start_point == nil
+    or self.options.get_loop_rate == nil then
+    return nil
+  end
+  local width = math.max(0.01, anchor.end_point - anchor.start_point)
+  local anchor_phase = ((anchor.pos - anchor.start_point) / width) % 1
+  local rate = self.options.get_loop_rate(anchor.start_point, anchor.end_point) or 0
+  local dir = (self.options.get_playhead_direction ~= nil and self.options.get_playhead_direction()) or 1
+  local elapsed = util.time() - (anchor.time or util.time())
+  return (anchor_phase + (dir * elapsed * rate)) % 1
+end
+
+-- Shared release behavior for every override layer (live keys, sequenced steps,
+-- live-held steps): where the playhead lands in the region playback reverts to.
+function GridSequencer:apply_release_mode(mode, start_point, end_point, anchor)
   if mode == "reset" then
     self:set_region_with_phase(start_point, end_point, 0)
   elseif mode == "return" then
-    -- Snap back to where the sequence would be: reset to the current active
-    -- region start. NOTE: without a shadow phase clock this rejoins at the
-    -- region start rather than the exact mid-step position -- a follow-up
-    -- (task #21b) can track the sequencer's own phase for a seamless return.
-    self:set_region_with_phase(start_point, end_point, 0)
+    local phase = self:natural_phase_from(anchor)
+    if phase ~= nil then
+      self:set_region_with_phase(start_point, end_point, phase)
+    else
+      self:set_region_with_phase(start_point, end_point, 0)  -- fallback: reset
+    end
   else
-    -- Boomerang: keep advancing from the current absolute position.
+    -- Boomerang: keep going from the override's position (absolute position
+    -- preserved across the region change).
     self:set_region_preserve_position(start_point, end_point)
   end
 end
 
+-- The last live loop key was released during playback. The playhead-return mode
+-- decides where the playhead lands in the region the sequencer/track resolve to.
+function GridSequencer:apply_loop_release_playhead(start_point, end_point)
+  local mode = self:playhead_return_mode()
+  self:message("PH " .. mode)
+  self:apply_release_mode(mode, start_point, end_point, self.keys_anchor)
+  self.keys_anchor = nil
+end
+
+function GridSequencer:live_step_trig_enabled()
+  return self.options.get_live_step_trig ~= nil and self.options.get_live_step_trig() == true
+end
+
+-- Live Step Trig: while playing, holding a step fires it immediately and it
+-- owns playback for the duration of the hold -- sequenced steps advance
+-- silently (see enter_step) and the step's note length is ignored (its locks
+-- are pinned until release). Loop machines only; slice machines already have
+-- hold-to-play slice keys.
+function GridSequencer:begin_live_step(step)
+  if is_slice_machine(self:machine()) then
+    return
+  end
+  local record = self:step_record(self:step_index(self.selected_page, step), false)
+  if record == nil or record.trig ~= true then
+    return
+  end
+  if self.seq_anchor == nil then
+    self.seq_anchor = self:make_anchor()
+  end
+  self.seq_release_mode = self:step_release_mode(record)
+  self.live_step_index = step
+  self.live_step_hold = true
+
+  if self:trig_polyphony() == 1 and not self:is_ghost(record) then
+    self:clear_param_lock_holds()
+  end
+  if self.options.apply_step_param_locks ~= nil then
+    self.options.apply_step_param_locks(self:effective_param_locks(record))
+  end
+  -- No note-length window while held: pin this step's own locks until release.
+  for lock_id in pairs(record.param_locks or {}) do
+    if self.param_lock_holds[lock_id] ~= nil then
+      self.param_lock_holds[lock_id].expires_at = math.huge
+    end
+  end
+  self:apply_step_pitch(record)
+  self:apply_active_range()
+  if not self:is_ghost(record) and self.options.note_on ~= nil then
+    self.options.note_on(3600)  -- held note; the next trigger re-gates the env
+  end
+  local record_locks_region = record.param_locks ~= nil
+    and (record.param_locks.loop_start ~= nil or record.param_locks.loop_end ~= nil)
+  if record_locks_region then
+    local start_point, end_point = self:resolve_active_region()
+    if self:trig_jump_active(record) then
+      self:set_region_with_phase(start_point, end_point, 0)
+    else
+      self:set_region_within_or_warp(start_point, end_point)
+    end
+  end
+end
+
+function GridSequencer:end_live_step()
+  self.live_step_hold = false
+  self.live_step_index = nil
+  if not self.playing then
+    return
+  end
+  -- The held note ends: clear its pinned locks, revert params/pitch/range, and
+  -- release the playhead per the step's Trig Release mode.
+  self:clear_param_lock_holds()
+  if self.options.apply_step_param_locks ~= nil then
+    self.options.apply_step_param_locks(nil)
+  end
+  self:apply_step_pitch(nil)
+  self:apply_active_range()
+  local start_point, end_point = self:resolve_active_region()
+  if self.seq_anchor ~= nil and not any_keys(self.loop_holds) then
+    self:apply_release_mode(self.seq_release_mode or "return", start_point, end_point, self.seq_anchor)
+  else
+    self:set_region(start_point, end_point)
+  end
+  self.seq_anchor = nil
+end
+
 function GridSequencer:key_loop_control(x, z)
+  self.loop_key_programming = self.loop_key_programming or {}
   if z == 1 then
+    local programming = any_keys(self.step_holds)
+    local first_key = not any_keys(self.loop_holds)
+    self.loop_key_programming[x] = programming or nil
     self.loop_holds[x] = true
-    if any_keys(self.step_holds) then
+    if programming then
+      -- Holding a step: loop keys program that step's region lock (tap-cycle)
+      -- and never drive the live region -- the lock only sounds when the step
+      -- triggers. While stopped, the preview re-plays the step's own locks so
+      -- what you hear tracks the lock state (start-only vs start+end).
       local start_point, end_point, held_count = self:loop_region_from_holds(self.loop_holds)
       if start_point ~= nil then
         self:lock_held_steps(start_point, end_point, held_count)
       end
+      self:refresh_held_step()
+    else
+      if self.playing and first_key then
+        self.keys_anchor = self:make_anchor()  -- start of a live performance
+      end
+      self:apply_loop_key_region(true)
     end
-    self:apply_loop_key_region(true)
   else
+    local programming = self.loop_key_programming[x] == true
+    self.loop_key_programming[x] = nil
     self.loop_holds[x] = nil
-    self:apply_loop_key_region(false)
+    if programming then
+      self:refresh_held_step()
+    else
+      self:apply_loop_key_region(false)
+    end
   end
   self:update_preview_state()
 end
@@ -1585,22 +1884,31 @@ function GridSequencer:key_step_row(x, z)
     self.step_edited[x] = false
     self.loop_tap_key = nil
     self.loop_tap_kind = nil
-    local lock = self:step_lock(self.selected_page, x)
-    if lock ~= nil and lock.end_point ~= nil then
-      self:set_region(lock.start_point, lock.end_point)
-    end
-    if not self.playing and self:step_preview_enabled() then
-      local record = self:step_record(self:step_index(self.selected_page, x), false)
-      -- Ghost steps reset nothing (no start, no region), so there is nothing to
-      -- preview -- skip them, same as sequenced playback carries through them.
-      if record ~= nil and record.trig == true and not self:is_ghost(record) then
-        -- Apply the step's Step Range before setting the region so the preview
-        -- plays the step's range window, not the whole trim.
-        local locks = record.param_locks or {}
-        self:push_active_range(locks.range_start, locks.range_end)
-        local start_point, end_point = self:locked_region(record)
-        self:set_region_with_phase(start_point, end_point, 0)
-        self:apply_step_pitch(record)
+    if self.playing then
+      -- During playback a held step is inert unless Live Step Trig is on:
+      -- auditioning its locked region live yanked the engine region under the
+      -- playing loop and popped.
+      if self:live_step_trig_enabled() then
+        self:begin_live_step(x)
+      end
+    else
+      local lock = self:step_lock(self.selected_page, x)
+      if lock ~= nil and lock.end_point ~= nil then
+        self:set_region(lock.start_point, lock.end_point)
+      end
+      if self:step_preview_enabled() then
+        local record = self:step_record(self:step_index(self.selected_page, x), false)
+        -- Ghost steps reset nothing (no start, no region), so there is nothing to
+        -- preview -- skip them, same as sequenced playback carries through them.
+        if record ~= nil and record.trig == true and not self:is_ghost(record) then
+          -- Apply the step's Step Range before setting the region so the preview
+          -- plays the step's range window, not the whole trim.
+          local locks = record.param_locks or {}
+          self:push_active_range(locks.range_start, locks.range_end)
+          local start_point, end_point = self:locked_region(record)
+          self:set_region_with_phase(start_point, end_point, 0)
+          self:apply_step_pitch(record)
+        end
       end
     end
   else
@@ -1619,15 +1927,17 @@ function GridSequencer:key_step_row(x, z)
         self:toggle_step(self.selected_page, x)
       end
     end
-    if not any_keys(self.step_holds) and not any_keys(self.loop_holds) then
-      if not self.playing then
-        self:push_active_range(nil, nil)
-      end
+    if self.live_step_index == x then
+      self:end_live_step()
+    end
+    if not any_keys(self.step_holds) and not any_keys(self.loop_holds)
+      and not self.playing then
+      -- Stopped: restore the base region/range/pitch after a preview or
+      -- lock-audition hold. During playback the sequencer owns the region.
+      self:push_active_range(nil, nil)
       local base_start, base_end = self:base_region()
       self:set_region(base_start, base_end)
-      if not self.playing then
-        self:apply_step_pitch(nil)
-      end
+      self:apply_step_pitch(nil)
     end
   end
   self:update_preview_state()

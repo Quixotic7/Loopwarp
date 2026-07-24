@@ -214,8 +214,50 @@ local function source_warp_items()
   return items
 end
 
+-- AMP page: layout depends on envelope mode. Top row is the envelope (ADSR or
+-- AHR), bottom row is empty, empty, Pan, Track Volume.
+local function amp_env_items()
+  local items
+  if param_value_or("env_mode", 2) == 1 then  -- ADSR
+    items = {
+      ParamItem.item("env_attack", "ATK", {lockable = true, min = 0, max = 127, step = 1}),
+      ParamItem.item("env_decay", "DEC", {lockable = true, min = 0, max = 127, step = 1}),
+      ParamItem.item("env_sustain", "SUS", {lockable = true, min = 0, max = 127, step = 1}),
+      ParamItem.item("env_release", "REL", {lockable = true, min = 0, max = 127, step = 1})
+    }
+  else  -- AHR (default)
+    items = {
+      ParamItem.item("env_attack", "ATK", {lockable = true, min = 0, max = 127, step = 1}),
+      ParamItem.item("env_hold", "HOLD", {lockable = true, min = 0, max = 128, step = 1}),
+      ParamItem.item("env_release", "REL", {lockable = true, min = 0, max = 128, step = 1}),
+      ParamItem.blank()
+    }
+  end
+  table.insert(items, ParamItem.blank())
+  table.insert(items, ParamItem.blank())
+  table.insert(items, ParamItem.item("pan", "PAN", {lockable = true, min = 0, max = 128, step = 1}))
+  table.insert(items, ParamItem.item("amp", "VOL", {lockable = true, min = 0, max = 127, step = 1}))
+  return items
+end
+
+-- TRIG page 2 (machine trig): behavior params that only apply to the loop
+-- machines' continuous playhead -- empty for slice machines.
+local function trig_machine_items()
+  if param_value_or("machine", 1) >= 3 then  -- 3/4 = grid/razor slice
+    return {}
+  end
+  return {
+    ParamItem.item("trig_jump", "JUMP", {lockable = true, binary = true, min = 0, max = 1, step = 1}),
+    ParamItem.item("trig_release", "RLSE", {lockable = true, options = 3})
+  }
+end
+
 local function page_items_for(category, page, page_index)
-  if category == "source" and page_index == 1 then
+  if category == "amp" and page_index == 1 then
+    return amp_env_items()
+  elseif category == "trig" and page_index == 2 then
+    return trig_machine_items()
+  elseif category == "source" and page_index == 1 then
     return source_sample_items()
   elseif category == "source" and page_index == 2 then
     return source_machine_items()
@@ -803,6 +845,9 @@ function init()
         set_visual_phase(0)
       end
     end,
+    note_on = function(seconds)
+      elasticat.note_on(seconds)
+    end,
     base_region = function()
       return params:get(id("loop_start")), params:get(id("loop_end"))
     end,
@@ -827,6 +872,12 @@ function init()
     get_playhead_return = function()
       return params:get(id("playhead_return"))
     end,
+    get_loop_rate = function(start_point, end_point)
+      return loop_phase_rate(start_point, end_point)
+    end,
+    get_playhead_direction = function()
+      return playhead_direction()
+    end,
     play = function(state)
       elasticat.play(state)
     end,
@@ -838,6 +889,15 @@ function init()
     end,
     reset_default = function(reset_id)
       return params:lookup_param(id(reset_id)) ~= nil and params:get(id(reset_id)) == 1
+    end,
+    get_trig_jump = function()
+      return params:lookup_param(id("trig_jump")) ~= nil and params:get(id("trig_jump")) == 1
+    end,
+    get_trig_release = function()
+      return params:lookup_param(id("trig_release")) ~= nil and params:get(id("trig_release")) or 1
+    end,
+    get_live_step_trig = function()
+      return params:lookup_param(id("live_step_trig")) ~= nil and params:get(id("live_step_trig")) == 1
     end,
     get_slice_count = function()
       return params:get(id("slice_count"))
@@ -967,7 +1027,10 @@ function init()
           set_visual_phase(args[1])
         end
       elseif path == "/elasticat/reset" then
-        reset_visual_phase()
+        -- The engine echoes every playhead move as /elasticat/reset <phase>.
+        -- Honor the phase: forcing 0 here clobbered the visual playhead after
+        -- every Return/Boomerang release and every preserved-position trig.
+        set_visual_phase(args[1])
       elseif path == "/elasticat/requestedStatus" then
         if phase_reports_allowed() then
           set_visual_phase(args[4])
@@ -995,6 +1058,7 @@ function init()
   end
 
   set_playing(false, true)
+  elasticat.sync_amp_env()  -- push env/pan/vol defaults (their actions don't fire on add)
   start_intro()
   start_redraw_metro()
   redraw()

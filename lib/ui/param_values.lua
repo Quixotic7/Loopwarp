@@ -156,6 +156,8 @@ function ParamValues:item_long_name(param_item)
     -- Use the per-engine label (DUTY/MIX/CHAOS/SMEAR) in messages instead of the
     -- generic "mode macro" param name.
     return string.lower(param_item.short or "macro")
+  elseif param_item.id == "playhead_return" then
+    return "ph mode"  -- short so "playhead return <value>" doesn't get cut off
   end
 
   local full_id = self:item_param_id(param_item)
@@ -264,6 +266,14 @@ function ParamValues:format_item_value(param_item, value)
     return self.sample_name()
   elseif param_item.binary then
     return (value or 0) >= 1 and "on" or "off"
+  elseif (param_item.id == "env_hold" or param_item.id == "env_release")
+    and (value or self:item_raw_value(param_item)) >= 128 then
+    return "INF"
+  elseif param_item.id == "trig_release" then
+    -- "boomerang" overflows a cell; compact forms for the machine-trig page.
+    local names = {"rtrn", "boom", "rset"}
+    local raw = math.floor((value or self.param_value_or(param_item.id, 1)) + 0.5)
+    return names[raw] or names[1]
   elseif param_item.id == "slice_play_mode" then
     local param = params:lookup_param(self.id(param_item.id))
     local options = param ~= nil and param.options or {}
@@ -420,7 +430,8 @@ function ParamValues:apply_param_lock_value(lock_id, value)
   if lock_id == "length" or lock_id == "velocity"
     or lock_id == "loop_start" or lock_id == "loop_end"
     or lock_id == "range_start" or lock_id == "range_end"
-    or lock_id == "env_reset" or lock_id == "lfo_reset" or lock_id == "filter_reset" then
+    or lock_id == "env_reset" or lock_id == "lfo_reset" or lock_id == "filter_reset"
+    or lock_id == "trig_jump" or lock_id == "trig_release" then
     return
   end
   local full_id = self.id(lock_id)

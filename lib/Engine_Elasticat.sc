@@ -24,6 +24,7 @@ Engine_Elasticat : CroneEngine {
 	var transportResponder;
 	var modeSynthNames;
 	var modeNames;
+	var readerAmpEnv;  // shared amp-envelope graph for the continuous mode readers
 	var activeMode = 0;
 	var playing = 0;
 	var targetBpm = 120;
@@ -69,6 +70,19 @@ Engine_Elasticat : CroneEngine {
 	var debugLevel = 1;
 	var sliceAttack = 0.002;
 	var sliceRelease = 0.02;
+	// Amp envelope (Amp page). envMode 0 = ADSR, 1 = AHR. Times in seconds,
+	// sustain 0..1. Stored here; the reader/slice-voice DSP wiring lands next.
+	// Defaults match the AHR drone default (0 / INF / 0) so the first play drones
+	// even before the script syncs the params.
+	var envMode = 1;
+	var envAttack = 0.0001;
+	var envDecay = 0.15;
+	var envSustain = 0.8;
+	var envRelease = 0.0001;
+	var envHold = 1000000;
+	var envTrigCount = 0;      // bumped per note-on to retrigger the amp envelope
+	var envNoteSeconds = 0.5;  // current note length (ADSR gate window)
+	var portamento = 0;        // 1 = overlapping trigger glides (no re-attack)
 	var sliceMono = 0;
 	var sliceSyncToClock = 1;
 	var sliceRate = 1;
@@ -182,6 +196,25 @@ Engine_Elasticat : CroneEngine {
 	}
 
 	addSynthDefs {
+		// Shared amp-envelope graph for the continuous mode readers. Retriggered
+		// per step via the envTrig counter; portamento suppresses re-attack on an
+		// overlapping (still-sounding) note. Huge envHold/envRelease act as INF.
+		readerAmpEnv = { arg envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento;
+			var rawTrig, window, reEdge, adsrGate, ahrTrig, adsr, ahr, port;
+			port = portamento.clip(0, 1);
+			rawTrig = Changed.kr(envTrig);
+			window = Trig.kr(rawTrig, envGateSeconds.max(0.001));
+			reEdge = 1 - Trig.kr(rawTrig, ControlDur.ir * 1.5);
+			adsrGate = window * Select.kr(port, [reEdge, DC.kr(1)]);
+			ahrTrig = Select.kr(port, [rawTrig, Trig.kr(window, 0)]);
+			adsr = EnvGen.kr(
+				Env.adsr(envAttack.max(0.0001), envDecay.max(0.0001), envSustain.clip(0, 1), envRelease.max(0.0001), 1, -4),
+				adsrGate, doneAction: 0);
+			ahr = EnvGen.kr(
+				Env([0, 1, 1, 0], [envAttack.max(0.0001), envHold.max(0.0001), envRelease.max(0.0001)], [-4, 0, -4]),
+				ahrTrig, doneAction: 0);
+			Select.kr(envMode.clip(0, 1), [adsr, ahr]);
+		};
 		SynthDef(\elasticatTransport, {
 			arg out=0, playing=0, targetBpm=120, loopBeats=4, resetTrig=0,
 			resetPos=0, correction=0;
@@ -190,7 +223,7 @@ Engine_Elasticat : CroneEngine {
 			run = Lag.kr(playing.clip(0, 1), 0.01);
 			cyclesPerSecond = (targetBpm.max(1) / 60) / loopBeats.max(0.03125);
 			phase = Phasor.ar(
-				resetTrig,
+				Changed.kr(resetTrig),  // resetTrig is a monotonic counter; edge-detect it so every set resets
 				(cyclesPerSecond * (1 + correction.clip(-0.1, 0.1)) * run) / SampleRate.ir,
 				0,
 				1,
@@ -230,7 +263,10 @@ Engine_Elasticat : CroneEngine {
 			arg out=0, phaseBus=0, bufL=0, bufR=0, modeAmp=1, fadeTime=0.05,
 			playing=0, resetTrig=0, resetPos=0,
 			amp=0.8, pan=0, pitch=0, targetBpm=120, loopBeats=4, macro=0,
-			startPoint=0, endPoint=128, chopBeats=0.25, chopMode=0, chopAttack=0.002, chopHold=0.04, chopRelease=0.01;
+			startPoint=0, endPoint=128, chopBeats=0.25, chopMode=0, chopAttack=0.002, chopHold=0.04, chopRelease=0.01,
+			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
+			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0;
+			var ampEnv;
 			var phase, frames, pos, trig, beatDur, duty, env, sig, modeGain, playGate, startNorm, range, readPhase;
 			var pitchSmooth, sliceWidth, sliceStart, localPhase, forwardStop, loopForward, pingPong, pingPongPhase, stepRate, stopGate;
 			phase = In.ar(phaseBus, 1);
@@ -263,7 +299,8 @@ Engine_Elasticat : CroneEngine {
 			] * env * Select.ar(chopMode.clip(0, 2), [stopGate, DC.ar(1), DC.ar(1)]);
 			playGate = Lag.kr(playing.clip(0, 1), 0.01);
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
-			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * playGate);
+			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento);
+			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
 			SendReply.kr(Impulse.kr(30), cmdName: '/elasticat/statusRaw', values: [
 				2, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
@@ -275,7 +312,10 @@ Engine_Elasticat : CroneEngine {
 			arg out=0, phaseBus=0, bufL=0, bufR=0, modeAmp=1, fadeTime=0.05,
 			playing=0, resetTrig=0, resetPos=0,
 			amp=0.8, pan=0, pitch=0, targetBpm=120, loopBeats=4, macro=0,
-			startPoint=0, endPoint=128, grainSize=0.08, grainOverlap=8, grainJitter=0.0, grainSpray=0.0;
+			startPoint=0, endPoint=128, grainSize=0.08, grainOverlap=8, grainJitter=0.0, grainSpray=0.0,
+			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
+			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0;
+			var ampEnv;
 			var phase, frames, pos, dur, randomness, direct, wet, sig, modeGain, playGate, gainNorm, startNorm, range, readPhase, stepDur, overlap, overlapControl;
 			phase = In.ar(phaseBus, 1);
 			frames = BufFrames.kr(bufL).max(4);
@@ -300,7 +340,8 @@ Engine_Elasticat : CroneEngine {
 			gainNorm = overlap.sqrt.reciprocal * 2.5 * (1 + (macro.clip(0, 1) * 0.25));
 			playGate = Lag.kr(playing.clip(0, 1), 0.01);
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
-			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * gainNorm * playGate);
+			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento);
+			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * gainNorm * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
 			SendReply.kr(Impulse.kr(30), cmdName: '/elasticat/statusRaw', values: [
 				3, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
@@ -312,7 +353,10 @@ Engine_Elasticat : CroneEngine {
 			arg out=0, phaseBus=0, bufL=0, bufR=0, modeAmp=1, fadeTime=0.05,
 			playing=0, resetTrig=0, resetPos=0,
 			amp=0.8, pan=0, pitch=0, targetBpm=120, loopBeats=4, macro=0,
-			startPoint=0, endPoint=128, grainSize=0.1, grainOverlap=6, wander=0.03, timingJitter=0.0;
+			startPoint=0, endPoint=128, grainSize=0.1, grainOverlap=6, wander=0.03, timingJitter=0.0,
+			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
+			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0;
+			var ampEnv;
 			var phase, frames, trig, dur, rate, chaos, pos, offset, direct, wet, sig, modeGain, playGate, gainNorm, startNorm, range, readPhase, stepDur, overlapControl, wanderControl;
 			phase = In.ar(phaseBus, 1);
 			frames = BufFrames.kr(bufL).max(4);
@@ -340,7 +384,8 @@ Engine_Elasticat : CroneEngine {
 			gainNorm = overlapControl.sqrt.reciprocal * 2.5;
 			playGate = Lag.kr(playing.clip(0, 1), 0.01);
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
-			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * gainNorm * playGate);
+			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento);
+			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * gainNorm * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
 			SendReply.kr(Impulse.kr(30), cmdName: '/elasticat/statusRaw', values: [
 				4, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
@@ -352,7 +397,10 @@ Engine_Elasticat : CroneEngine {
 			arg out=0, phaseBus=0, bufL=0, bufR=0, modeAmp=1, fadeTime=0.05,
 			playing=0, resetTrig=0, resetPos=0,
 			amp=0.8, pan=0, pitch=0, targetBpm=120, derivedSourceBpm=120, loopBeats=4,
-			startPoint=0, endPoint=128, pvWindow=0.2, pvDispersion=0, pvTimeDispersion=0, macro=0;
+			startPoint=0, endPoint=128, pvWindow=0.2, pvDispersion=0, pvTimeDispersion=0, macro=0,
+			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
+			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0;
+			var ampEnv;
 			var phase, frames, pos, raw, shifted, ratio, sig, modeGain, playGate, window, startNorm, range, readPhase;
 			phase = In.ar(phaseBus, 1);
 			frames = BufFrames.kr(bufL).max(4);
@@ -370,7 +418,8 @@ Engine_Elasticat : CroneEngine {
 			sig = shifted;
 			playGate = Lag.kr(playing.clip(0, 1), 0.01);
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
-			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * playGate);
+			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento);
+			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
 			SendReply.kr(Impulse.kr(30), cmdName: '/elasticat/statusRaw', values: [
 				5, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
@@ -383,13 +432,14 @@ Engine_Elasticat : CroneEngine {
 			startPoint=0, endPoint=8, playMode=0, reverse=0,
 			amp=0.8, pan=0, pitch=0, velocity=1, gate=1,
 			sliceAttack=0.002, sliceRelease=0.02,
+			envMode=1, envAttack=0.0001, envDecay=0.15, envSustain=0.8, envRelease=0.0001, envHold=1000000,
 			lengthSeconds=0, syncToClock=1, sliceRate=1, warpMode=0,
 			targetBpm=120, macro=0, grainSize=0.08, grainOverlap=8,
 			grainJitter=0, wsolaWindow=0.1, wsolaSearch=0.03,
 			pvWindow=0.2, pvDispersion=0;
 			var frames, startFrame, endFrame, loFrame, hiFrame, continueMode, readLo, readHi, loopMode;
 			var directionSign, resetFrame, rangeFrames, duration, pitchRatio, freePitchRatio, freeRate, fitRate, readRate;
-			var pos, loopPos, sweepFrames, sweepForwardPos, sweepReversePos, sweepPos, readPhase, env, raw, grain, ola, pc, sig, playAmp;
+			var pos, loopPos, sweepFrames, sweepForwardPos, sweepReversePos, sweepPos, readPhase, env, adsrEnv, ahrEnv, raw, grain, ola, pc, sig, playAmp;
 			var grainDur, grainCount, grainRandom, olaTrig, olaPos, pcRatio;
 
 			frames = BufFrames.kr(bufL).max(4);
@@ -424,11 +474,20 @@ Engine_Elasticat : CroneEngine {
 			sweepPos = Select.ar(reverse.clip(0, 1), [sweepForwardPos, sweepReversePos]);
 			pos = Select.ar(loopMode, [sweepPos.clip(readLo, readHi), loopPos]);
 			readPhase = (pos / (frames - 1)).clip(0, 0.999999);
-			env = EnvGen.kr(
-				Env.asr(sliceAttack.max(0.0001), 1, sliceRelease.max(0.0001), curve: -4),
-				gate,
-				doneAction: 2
-			);
+			// Amp envelope (shared with the readers). ADSR sustains while the slice
+			// gate is held and releases on gate-off; AHR is a fixed attack/hold/
+			// release burst (Hold matters, same as the loop reader). Hold/release are
+			// capped so an INF setting can't strand a polyphonic voice. Both run at
+			// doneAction 0; FreeSelf frees on gate-release+decay (ADSR) or when the
+			// burst completes (AHR).
+			adsrEnv = EnvGen.kr(
+				Env.adsr(envAttack.max(0.0001), envDecay.max(0.0001), envSustain.clip(0, 1), envRelease.clip(0.0001, 30), 1, -4),
+				gate, doneAction: 0);
+			ahrEnv = EnvGen.kr(
+				Env([0, 1, 1, 0], [envAttack.max(0.0001), envHold.clip(0.0001, 30), envRelease.clip(0.0001, 30)], [-4, 0, -4]),
+				gate, doneAction: 0);
+			env = Select.kr(envMode.clip(0, 1), [adsrEnv, ahrEnv]);
+			FreeSelf.kr(Select.kr(envMode.clip(0, 1), [(gate < 0.5) * (adsrEnv < 0.0004), Done.kr(ahrEnv)]));
 			raw = [
 				BufRd.ar(1, bufL, pos, loop: 1, interpolation: 4),
 				BufRd.ar(1, bufR, pos, loop: 1, interpolation: 4)
@@ -464,15 +523,18 @@ Engine_Elasticat : CroneEngine {
 			arg out=0, phaseBus=0, bufL=0, bufR=0, modeAmp=1, fadeTime=0.05,
 			playing=0, resetTrig=0, resetPos=0,
 			amp=0.8, pan=0, pitch=0, speed=1, direction=1,
-			targetBpm=120, derivedSourceBpm=120, loopBeats=4, startPoint=0, endPoint=128;
+			targetBpm=120, derivedSourceBpm=120, loopBeats=4, startPoint=0, endPoint=128,
+			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
+			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0;
 			var phase, frames, sourcePhase, pos, sig, modeGain, playGate, pitchRatio, startNorm, range, nativeIncrement;
+			var ampEnv;
 			frames = BufFrames.kr(bufL).max(4);
 			pitchRatio = Lag.kr(pitch, 0.03).midiratio.clip(0.03125, 32);
 			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.002);
 			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.002);
 			if(modeId == 0, {
 				nativeIncrement = (BufRateScale.kr(bufL) * speed.max(0.03125) * pitchRatio) / (frames * range).max(1);
-				phase = Phasor.ar(resetTrig, nativeIncrement * playing.clip(0, 1), 0, 1, resetPos.clip(0, 0.999999));
+				phase = Phasor.ar(Changed.kr(resetTrig), nativeIncrement * playing.clip(0, 1), 0, 1, resetPos.clip(0, 0.999999));
 			}, {
 				phase = In.ar(phaseBus, 1);
 			});
@@ -490,7 +552,8 @@ Engine_Elasticat : CroneEngine {
 			];
 			playGate = Lag.kr(playing.clip(0, 1), 0.01);
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
-			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * playGate);
+			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento);
+			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
 			SendReply.kr(Impulse.kr(30), cmdName: '/elasticat/statusRaw', values: [
 				modeId, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
@@ -573,6 +636,22 @@ Engine_Elasticat : CroneEngine {
 		this.addCommand(\releaseAllSlices, "", { this.releaseAllSlices; });
 		this.addCommand(\sliceAttack, "f", { arg msg; sliceAttack = msg[1].clip(0.0001, 0.2); });
 		this.addCommand(\sliceRelease, "f", { arg msg; sliceRelease = msg[1].clip(0.0001, 0.5); });
+		this.addCommand(\setEnvMode, "i", { arg msg; envMode = msg[1].clip(0, 1); this.setActive(\envMode, envMode); });
+		this.addCommand(\envAttack, "f", { arg msg; envAttack = msg[1].max(0); this.setActive(\envAttack, envAttack); });
+		this.addCommand(\envDecay, "f", { arg msg; envDecay = msg[1].max(0); this.setActive(\envDecay, envDecay); });
+		this.addCommand(\envSustain, "f", { arg msg; envSustain = msg[1].clip(0, 1); this.setActive(\envSustain, envSustain); });
+		this.addCommand(\envRelease, "f", { arg msg; envRelease = msg[1].max(0); this.setActive(\envRelease, envRelease); });
+		this.addCommand(\envHold, "f", { arg msg; envHold = msg[1].max(0); this.setActive(\envHold, envHold); });
+		this.addCommand(\setPortamento, "i", { arg msg; portamento = msg[1].clip(0, 1); this.setActive(\portamento, portamento); });
+		// Note-on: retrigger the amp envelope on the active reader. Sets the ADSR
+		// gate window (note length) then bumps the trigger counter.
+		this.addCommand(\noteOn, "f", { arg msg;
+			envNoteSeconds = msg[1].max(0.005);
+			envTrigCount = envTrigCount + 1;
+			if(activeSynth.notNil, {
+				activeSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
+			});
+		});
 		this.addCommand(\setSliceMono, "i", { arg msg; sliceMono = msg[1].asInteger.clip(0, 1); });
 		this.addCommand(\setSliceSyncToClock, "i", { arg msg; sliceSyncToClock = msg[1].asInteger.clip(0, 1); });
 		this.addCommand(\setSliceRate, "f", { arg msg; sliceRate = msg[1].clip(0.03125, 16); });
@@ -609,7 +688,16 @@ Engine_Elasticat : CroneEngine {
 			\loopBeats, this.activeLoopBeats,
 			\startPoint, loopStart,
 			\endPoint, loopEnd,
-			\macro, modeMacro
+			\macro, modeMacro,
+			\envMode, envMode,
+			\envAttack, envAttack,
+			\envDecay, envDecay,
+			\envSustain, envSustain,
+			\envRelease, envRelease,
+			\envHold, envHold,
+			\envTrig, envTrigCount,
+			\envGateSeconds, envNoteSeconds,
+			\portamento, portamento
 		];
 	}
 
@@ -707,6 +795,12 @@ Engine_Elasticat : CroneEngine {
 			\velocity, velocity.asFloat.clip(0, 1),
 			\sliceAttack, sliceAttack,
 			\sliceRelease, sliceRelease,
+			\envMode, envMode,
+			\envAttack, envAttack,
+			\envDecay, envDecay,
+			\envSustain, envSustain,
+			\envRelease, envRelease,
+			\envHold, envHold,
 			\lengthSeconds, duration,
 			\syncToClock, sliceSyncToClock,
 			\sliceRate, sliceRate,

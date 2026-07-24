@@ -10,7 +10,7 @@ local page_model = {
         title = "MASTER",
         items = {
           item("target_bpm", "BPM", {lockable = false, min = 20, max = 300, step = 1, snaps = {60, 80, 90, 100, 110, 120, 128, 136, 140, 160, 180}}),
-          item("amp", "VOL", {lockable = true, min = 0, max = 2, step = 0.01, snaps = {0, 0.25, 0.5, 0.75, 0.8, 1, 1.25, 1.5, 2}})
+          item("amp", "VOL", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 100, 127}})
         }
       },
       {
@@ -25,6 +25,7 @@ local page_model = {
       item("clock_sync", "SYNC", {binary = true, min = 0, max = 1, step = 1}),
       item("live_performance_mode", "LPRF", {binary = true, min = 0, max = 1, step = 1}),
       item("step_preview", "PREV", {binary = true, min = 0, max = 1, step = 1}),
+      item("live_step_trig", "LTRG", {binary = true, min = 0, max = 1, step = 1}),
       item("debug", "DBG", {options = 4})
     }
   },
@@ -47,6 +48,7 @@ local page_model = {
     title = "TRIG",
     pages = {
       {
+        -- Page 1: trig params common to every machine.
         title = "TRIG",
         items = {
           item("pitch", "NOTE", {lockable = true, min = -24, max = 24, step = 0.1, snaps = {-24, -12, -7, 0, 7, 12, 24}}),
@@ -56,6 +58,15 @@ local page_model = {
           item("env_reset", "ERST", {lockable = true, binary = true, min = 0, max = 1, step = 1}),
           item("lfo_reset", "LRST", {lockable = true, binary = true, min = 0, max = 1, step = 1}),
           item("filter_reset", "FRST", {lockable = true, binary = true, min = 0, max = 1, step = 1})
+        }
+      },
+      {
+        -- Page 2: machine trig behaviour. Items are resolved dynamically in
+        -- page_items_for (empty for slice machines); this is the fallback.
+        title = "MACHINE TRIG",
+        items = {
+          item("trig_jump", "JUMP", {lockable = true, binary = true, min = 0, max = 1, step = 1}),
+          item("trig_release", "RLSE", {lockable = true, options = 3})
         }
       }
     },
@@ -140,19 +151,27 @@ local page_model = {
     title = "AMP",
     pages = {
       {
+        -- Items are resolved dynamically per envelope mode in page_items_for
+        -- (ADSR vs AHR); this static list is the AHR-default fallback.
         title = "AMP",
         items = {
-          item("amp", "VOL", {lockable = true, min = 0, max = 2, step = 0.01, snaps = {0, 0.25, 0.5, 0.75, 0.8, 1, 1.25, 1.5, 2}}),
-          item("slice_attack", "ATK", {lockable = true, min = 0.0001, max = 0.2, step = 0.0005, snaps = {0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2}}),
-          item("slice_hold", "HOLD", {lockable = true, min = 0, max = 4, step = 0.01, snaps = {0, 0.05, 0.1, 0.25, 0.5, 1, 2, 4}}),
-          item("slice_release", "REL", {lockable = true, min = 0.0001, max = 0.5, step = 0.001, snaps = {0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5}}),
-          item("xfade", "XFAD", {lockable = true, min = 0, max = 0.25, step = 0.001, snaps = {0, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25}})
+          item("env_attack", "ATK", {lockable = true, min = 0, max = 127, step = 1}),
+          item("env_hold", "HOLD", {lockable = true, min = 0, max = 128, step = 1}),
+          item("env_release", "REL", {lockable = true, min = 0, max = 128, step = 1}),
+          blank(),
+          blank(),
+          blank(),
+          item("pan", "PAN", {lockable = true, min = 0, max = 128, step = 1}),
+          item("amp", "VOL", {lockable = true, min = 0, max = 127, step = 1})
         }
       }
     },
     settings = {
-      item("slice_hold_to_step", "HOLD", {binary = true, min = 0, max = 1, step = 1}),
-      item("slice_polyphony", "POLY", {options = 2})
+      item("env_mode", "ENVELOPE MODE", {options = 2}),
+      item("env_range", "ENVELOPE RANGE", {options = 10}),
+      item("portamento", "PORTAMENTO", {binary = true, min = 0, max = 1, step = 1}),
+      item("slice_hold_to_step", "SLICE HOLD", {binary = true, min = 0, max = 1, step = 1}),
+      item("slice_polyphony", "SLICE POLY", {options = 2})
     }
   },
   fx = {

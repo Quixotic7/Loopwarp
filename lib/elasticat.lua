@@ -274,6 +274,57 @@ local function format_ms(param)
   return tostring(math.floor((param:get() * 1000) + 0.5)) .. " ms"
 end
 
+-- Elektron-style envelope times: the 0-127 param is mapped to seconds on an
+-- exponential curve. `env_range` sets the full-scale seconds (value 127 -> that
+-- many seconds); the curve keeps the low end in milliseconds and ramps into
+-- seconds toward the top.
+local ENV_RANGE_VALUES = {1, 4, 8, 16, 32, 64, 128, 256, 512, 1024}
+local ENV_TIME_SHAPE = 6  -- curve steepness; higher = more ms resolution down low
+local ENV_INFINITE_VALUE = 128       -- hold/release value that means "infinite"
+local ENV_INFINITE_SECONDS = 1000000 -- ~11.5 days; effectively infinite to the engine
+
+local function env_range_seconds()
+  if ids.env_range == nil or params:lookup_param(ids.env_range) == nil then
+    return 8
+  end
+  return ENV_RANGE_VALUES[params:get(ids.env_range)] or 8
+end
+
+-- 0-127 -> seconds on an exponential curve; 128 is the "infinite" sentinel.
+local function env_value_to_seconds(v)
+  v = v or 0
+  if v >= ENV_INFINITE_VALUE then
+    return ENV_INFINITE_SECONDS
+  end
+  local n = util.clamp(v / 127, 0, 1)
+  local curve = (math.exp(ENV_TIME_SHAPE * n) - 1) / (math.exp(ENV_TIME_SHAPE) - 1)
+  return env_range_seconds() * curve
+end
+
+local function format_env_time(param)
+  if param:get() >= ENV_INFINITE_VALUE then
+    return "INF"
+  end
+  local secs = env_value_to_seconds(param:get())
+  if secs < 1 then
+    return string.format("%d ms", math.floor((secs * 1000) + 0.5))
+  end
+  return string.format("%.2f s", secs)
+end
+
+local function format_env_level(param)
+  return tostring(math.floor((param:get() / 127 * 100) + 0.5)) .. "%"
+end
+
+local function format_pan_127(param)
+  local v = math.floor(param:get() + 0.5) - 64
+  if v == 0 then return "C" end
+  return (v < 0 and "L" or "R") .. tostring(math.abs(v))
+end
+
+-- resend_env_times is defined after queue_engine_call (below) so it can use it.
+local resend_env_times
+
 local function clock_param_is_internal()
   return params:lookup_param("clock_source") ~= nil and params:get("clock_source") == 1
 end
@@ -485,6 +536,18 @@ local function queue_engine_call(key, name, ...)
   end)
 end
 
+-- Re-send the envelope times to the engine (used when env_range changes the
+-- seconds mapping); guarded so it is a no-op before the params exist.
+resend_env_times = function()
+  if ids.env_attack == nil or params:lookup_param(ids.env_attack) == nil then
+    return
+  end
+  queue_engine_call(ids.env_attack, "envAttack", env_value_to_seconds(params:get(ids.env_attack)))
+  queue_engine_call(ids.env_decay, "envDecay", env_value_to_seconds(params:get(ids.env_decay)))
+  queue_engine_call(ids.env_release, "envRelease", env_value_to_seconds(params:get(ids.env_release)))
+  queue_engine_call(ids.env_hold, "envHold", env_value_to_seconds(params:get(ids.env_hold)))
+end
+
 -- Coalesced (12Hz) version of update_engine_loop_points -- used when re-mapping
 -- the loop points from a rapidly-scrubbed control (Range) during playback, so
 -- per-detent edits don't flood the engine with immediate sends and feel laggy.
@@ -506,7 +569,8 @@ send_effective_amp = function()
   if ids.amp == nil or params:lookup_param(ids.amp) == nil then
     return
   end
-  local base = params:get(ids.amp)
+  -- Track Volume is an Elektron-style 0-127 param; map to a 0..1 amplitude.
+  local base = params:get(ids.amp) / 127
   local gain = sample_pool.gains[active_sample_slot] or 1
   queue_engine_call(ids.amp, "setAmp", base * gain)
 end
@@ -648,6 +712,32 @@ function elasticat.trigger_slice(slice_index, start_point, end_point, play_mode,
     length_seconds or 0,
     pitch_value or 0
   )
+end
+
+-- Retrigger the amp envelope on the active reader with the given note length
+-- (seconds, the ADSR gate window). Sent immediately -- envelope timing is tight.
+function elasticat.note_on(seconds)
+  engine_call("noteOn", seconds or 0.1)
+end
+
+-- Push the amp-envelope + pan/vol params to the engine. Needed on init because
+-- these params are added with their action set afterwards (so their defaults
+-- never fire) and aren't in older psets, leaving the engine on stale defaults.
+function elasticat.sync_amp_env()
+  if ids.env_mode == nil or params:lookup_param(ids.env_mode) == nil then
+    return
+  end
+  engine_call("setEnvMode", (params:get(ids.env_mode) or 2) - 1)
+  engine_call("envAttack", env_value_to_seconds(params:get(ids.env_attack)))
+  engine_call("envDecay", env_value_to_seconds(params:get(ids.env_decay)))
+  engine_call("envSustain", util.clamp((params:get(ids.env_sustain) or 100) / 127, 0, 1))
+  engine_call("envRelease", env_value_to_seconds(params:get(ids.env_release)))
+  engine_call("envHold", env_value_to_seconds(params:get(ids.env_hold)))
+  engine_call("setPortamento", params:get(ids.portamento) or 0)
+  send_effective_amp()
+  if ids.pan ~= nil then
+    engine_call("setPan", ((params:get(ids.pan) or 64) - 64) / 64)
+  end
 end
 
 function elasticat.release_slice(slice_index)
@@ -948,6 +1038,9 @@ function elasticat.params(options)
   ids.pattern_steps = param_id(prefix, "pattern_steps")
   ids.default_length = param_id(prefix, "default_length")
   ids.default_velocity = param_id(prefix, "default_velocity")
+  ids.trig_jump = param_id(prefix, "trig_jump")
+  ids.trig_release = param_id(prefix, "trig_release")
+  ids.live_step_trig = param_id(prefix, "live_step_trig")
   ids.env_reset = param_id(prefix, "env_reset")
   ids.lfo_reset = param_id(prefix, "lfo_reset")
   ids.filter_reset = param_id(prefix, "filter_reset")
@@ -962,6 +1055,15 @@ function elasticat.params(options)
   ids.debug = param_id(prefix, "debug")
   ids.live_performance_mode = param_id(prefix, "live_performance_mode")
   ids.step_preview = param_id(prefix, "step_preview")
+  ids.pan = param_id(prefix, "pan")
+  ids.env_attack = param_id(prefix, "env_attack")
+  ids.env_decay = param_id(prefix, "env_decay")
+  ids.env_sustain = param_id(prefix, "env_sustain")
+  ids.env_release = param_id(prefix, "env_release")
+  ids.env_hold = param_id(prefix, "env_hold")
+  ids.env_mode = param_id(prefix, "env_mode")
+  ids.env_range = param_id(prefix, "env_range")
+  ids.portamento = param_id(prefix, "portamento")
 
   local function apply_current_mode_params()
     local mode = params:get(ids.mode)
@@ -1049,7 +1151,9 @@ function elasticat.params(options)
   -- playback: return (rejoin the sequence), boomerang (keep going from the
   -- current position), reset (jump to the region start). grid_sequencer reads
   -- this live; no engine action.
-  params:add_option(ids.playhead_return, "playhead return", {"return", "boomerang", "reset"}, 2)
+  -- Default Return: a tempo-warped loop stays perfectly synced through live
+  -- loop-key performances, same reasoning as the step-level trig_release.
+  params:add_option(ids.playhead_return, "playhead return", {"return", "boomerang", "reset"}, 1)
 
   add_control(ids.mode_macro, "mode macro",
     cs.new(0, 1, "lin", 0.001, 0, "", 0.001),
@@ -1075,13 +1179,65 @@ function elasticat.params(options)
   params:add_binary(ids.live_performance_mode, "live performance mode", "toggle", 0)
   params:add_binary(ids.step_preview, "step preview", "toggle", 1)
 
+  -- Track Volume + Pan are Elektron-style 0-127 (Pan centered at 64). The engine
+  -- still receives a 0..1 amplitude / -1..1 pan; the mapping happens here.
   add_control(ids.amp, "amp",
-    cs.new(0, 2, "lin", 0.01, 0.8, "", 0.005),
-    function(_) send_effective_amp() end)
+    cs.new(0, 127, "lin", 1, 100, "", 1 / 127),
+    function(_) send_effective_amp() end,
+    format_env_level)
 
-  add_control(param_id(prefix, "pan"), "pan",
-    cs.new(-1, 1, "lin", 0.01, 0, "", 0.005),
-    function(x) queue_engine_call(param_id(prefix, "pan"), "setPan", x) end)
+  -- Pan is bipolar, so it uses 0-128 (129 values) for a true center at 64:
+  -- 0 = hard left, 64 = center, 128 = hard right, symmetric 64 steps each side.
+  add_control(ids.pan, "pan",
+    cs.new(0, 128, "lin", 1, 64, "", 1 / 128),
+    function(x) queue_engine_call(ids.pan, "setPan", (x - 64) / 64) end,
+    format_pan_127)
+
+  -- Amp envelope (0-127 Elektron style; times mapped exponentially to seconds via
+  -- env_range). ADSR uses attack/decay/sustain/release, AHR uses attack/hold/release.
+  add_control(ids.env_attack, "env attack",
+    cs.new(0, 127, "lin", 1, 0, "", 1 / 127),
+    function(x) queue_engine_call(ids.env_attack, "envAttack", env_value_to_seconds(x)) end,
+    format_env_time)
+
+  add_control(ids.env_decay, "env decay",
+    cs.new(0, 127, "lin", 1, 64, "", 1 / 127),
+    function(x) queue_engine_call(ids.env_decay, "envDecay", env_value_to_seconds(x)) end,
+    format_env_time)
+
+  add_control(ids.env_sustain, "env sustain",
+    cs.new(0, 127, "lin", 1, 100, "", 1 / 127),
+    function(x) queue_engine_call(ids.env_sustain, "envSustain", util.clamp(x / 127, 0, 1)) end,
+    format_env_level)
+
+  -- Release and Hold reach 128 = INF: the envelope holds (AHR) / stays at sustain
+  -- (ADSR) forever until the next trigger. Default AHR is 0 / INF / 0 -- an
+  -- instant attack that holds full, i.e. a continuous drone.
+  add_control(ids.env_release, "env release",
+    cs.new(0, 128, "lin", 1, 0, "", 1 / 128),
+    function(x) queue_engine_call(ids.env_release, "envRelease", env_value_to_seconds(x)) end,
+    format_env_time)
+
+  add_control(ids.env_hold, "env hold",
+    cs.new(0, 128, "lin", 1, 128, "", 1 / 128),
+    function(x) queue_engine_call(ids.env_hold, "envHold", env_value_to_seconds(x)) end,
+    format_env_time)
+
+  params:add_option(ids.env_mode, "envelope mode", {"ADSR", "AHR"}, 2)
+  params:set_action(ids.env_mode, function(x)
+    queue_engine_call(ids.env_mode, "setEnvMode", x - 1)  -- 0 = ADSR, 1 = AHR
+  end)
+
+  params:add_option(ids.env_range, "envelope range",
+    {"1s", "4s", "8s", "16s", "32s", "64s", "128s", "256s", "512s", "1024s"}, 3)
+  params:set_action(ids.env_range, function(_) resend_env_times() end)
+
+  -- Portamento (mono overlap): off = a new trigger re-attacks; on = an
+  -- overlapping trigger glides without re-attacking the amp envelope.
+  params:add_binary(ids.portamento, "portamento", "toggle", 0)
+  params:set_action(ids.portamento, function(x)
+    queue_engine_call(ids.portamento, "setPortamento", x)
+  end)
 
   add_control(param_id(prefix, "source_bpm"), "derived source bpm",
     cs.new(20, 300, "lin", 0.1, 120, "bpm", 1 / 280),
@@ -1214,6 +1370,27 @@ function elasticat.params(options)
   params:add_binary(ids.env_reset, "env reset", "toggle", 1)
   params:add_binary(ids.lfo_reset, "lfo reset", "toggle", 1)
   params:add_binary(ids.filter_reset, "filter reset", "toggle", 1)
+
+  -- Trig Jump (default on, p-lockable): on = a step with a start/end lock always
+  -- warps the playhead to the region start; off = it only repositions if the
+  -- playhead is now outside the new region (otherwise it keeps playing). Pure
+  -- sequencing behaviour in grid_sequencer -- no engine action.
+  params:add_binary(ids.trig_jump, "trig jump", "toggle", 1)
+  params:set_action(ids.trig_jump, function(_) end)
+
+  -- Trig Release (default Return, p-lockable): where the playhead lands when a
+  -- region-locking step's window ends. Return = where the main loop would
+  -- naturally be (keeps a tempo-warped loop perfectly synced through step
+  -- overrides), Boomerang = continue from the override's position, Reset =
+  -- region start. Pure sequencing behaviour in grid_sequencer.
+  params:add_option(ids.trig_release, "trig release", {"return", "boomerang", "reset"}, 1)
+  params:set_action(ids.trig_release, function(_) end)
+
+  -- Live Step Trig (master setting, default off): while playing, holding a step
+  -- fires it immediately and it overrides the sequence until released. Off =
+  -- holding a step during playback does nothing.
+  params:add_binary(ids.live_step_trig, "live step trig", "toggle", 0)
+  params:set_action(ids.live_step_trig, function(_) end)
 
   params:add_group(param_id(prefix, "group_loop"), "loop playback", 6)
 
