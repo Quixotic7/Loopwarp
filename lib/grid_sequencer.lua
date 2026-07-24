@@ -561,6 +561,10 @@ function GridSequencer:set_step_pitch(index, pitch)
   record.pitch = pitch
   record.param_locks = record.param_locks or {}
   record.param_locks.pitch = pitch
+  -- Grid-keyboard pitch entry (rows 5-7), unlike the encoder path, wrote the
+  -- lock but never pushed it live -- a held step's stopped preview or Live Step
+  -- Trig hold kept sounding the old pitch until release/re-press.
+  self:refresh_held_step()
 end
 
 function GridSequencer:apply_step_pitch(record)
