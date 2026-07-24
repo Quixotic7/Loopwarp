@@ -143,9 +143,37 @@ local page_model = {
   filter = {
     title = "FILTER",
     pages = {
-      {title = "FILTER", items = {}}
+      {
+        -- Page 1 (machine macro row) is resolved per filter machine in
+        -- page_items_for; this static list is the CLASSIC-default fallback.
+        title = "FILTER",
+        items = {
+          item("filter_type", "TYPE", {lockable = true, options = 4}),
+          item("filter_cutoff", "CUT", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}}),
+          item("filter_res", "RES", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}}),
+          item("filter_drive", "DRIV", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}})
+        }
+      },
+      {
+        -- Page 2 (filter envelope) is resolved per env mode in page_items_for;
+        -- this static list is the AHR-default fallback. DEPTH modulates cutoff.
+        title = "F.ENV",
+        items = {
+          item("filter_env_attack", "ATK", {lockable = true, min = 0, max = 127, step = 1}),
+          item("filter_env_hold", "HOLD", {lockable = true, min = 0, max = 128, step = 1}),
+          item("filter_env_release", "REL", {lockable = true, min = 0, max = 128, step = 1}),
+          blank(),
+          item("filter_env_depth", "DPTH", {lockable = true, min = 0, max = 128, step = 1}),
+          blank(),
+          blank(),
+          blank()
+        }
+      }
     },
-    settings = {}
+    settings = {
+      item("filter_machine", "MACH", {options = 2}),
+      item("filter_env_mode", "FENV", {options = 2})
+    }
   },
   amp = {
     title = "AMP",

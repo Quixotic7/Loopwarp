@@ -99,6 +99,30 @@ Engine_Elasticat : CroneEngine {
 	var wsolaSearch = 0.03;
 	var pvWindow = 0.2;
 	var pvDispersion = 0;
+	// Global filter (post-mix, pre master pan/vol). One shared instance per
+	// track, sitting in filterGroup after the voice sourceGroup. Machine is a
+	// setting (not p-lockable); Type/Cutoff/Res/Drive/Morph/Balance are. The
+	// filter envelope is independent of the amp env (its own mode) but reuses
+	// the amp env's seconds mapping on the script side.
+	var fxBus;
+	var sourceGroup;
+	var filterGroup;
+	var filterSynth;
+	var filterSynthNames;
+	var filterMachine = 0;
+	var filterType = 0;         // 0 LP, 1 HP, 2 BP, 3 notch (classic machines)
+	var filterCutoff = 20000;   // Hz (default wide open = effective bypass)
+	var filterRes = 0;          // 0..1
+	var filterDrive = 0;        // 0..1 pre-filter drive
+	var filterMorph = 0;        // 0..1 morphing machines: 0 LP -> 0.5 notch -> 1 HP
+	var filterBalance = 0;      // -1..1 stereo / mid-side balance (variant machines)
+	var filterEnvMode = 1;      // independent of amp env: 0 ADSR, 1 AHR
+	var filterEnvAttack = 0.0001;
+	var filterEnvDecay = 0.15;
+	var filterEnvSustain = 0.8;
+	var filterEnvRelease = 0.0001;
+	var filterEnvHold = 1000000;
+	var filterEnvDepth = 0;     // -1..1, scaled to +/-6 octaves of cutoff mod
 
 	*new { arg context, doneCallback;
 		^super.new(context, doneCallback);
@@ -126,6 +150,11 @@ Engine_Elasticat : CroneEngine {
 		];
 
 		phaseBus = Bus.audio(server, 1);
+		fxBus = Bus.audio(server, 2);
+		filterSynthNames = [
+			\elasticatFilterClassic,
+			\elasticatFilterMorph
+		];
 		bufL = Buffer.alloc(server, 4, 1);
 		bufR = Buffer.alloc(server, 4, 1);
 		defaultBufL = bufL;
@@ -183,15 +212,23 @@ Engine_Elasticat : CroneEngine {
 			]);
 		}, path: '/elasticat/statusRaw', srcID: server.addr);
 
+		// Voices (transport + readers + slices) live in sourceGroup and sum onto
+		// fxBus; the global filter reads fxBus in filterGroup (after sourceGroup)
+		// and writes the master out. New slice voices tail-add within sourceGroup,
+		// so they always precede the filter in the node order.
+		sourceGroup = Group.head(context.xg);
+		filterGroup = Group.after(sourceGroup);
+
 		transportSynth = Synth.new(\elasticatTransport, [
 			\out, phaseBus.index,
 			\playing, playing,
 			\targetBpm, targetBpm,
 			\loopBeats, this.activeLoopBeats,
 			\correction, correction
-		], context.xg);
+		], sourceGroup);
 
 		activeSynth = this.spawnMode(activeMode, 1);
+		this.spawnFilter;
 		this.installCommands;
 	}
 
@@ -300,7 +337,9 @@ Engine_Elasticat : CroneEngine {
 			playGate = Lag.kr(playing.clip(0, 1), 0.01);
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento);
-			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * playGate * ampEnv);
+			// Track pan + volume moved downstream to the filter output stage; the
+			// voice applies only its articulation gain (mode xfade, play gate, env).
+			sig = [sig[0], sig[1]] * (modeGain * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
 			SendReply.kr(Impulse.kr(30), cmdName: '/elasticat/statusRaw', values: [
 				2, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
@@ -341,7 +380,7 @@ Engine_Elasticat : CroneEngine {
 			playGate = Lag.kr(playing.clip(0, 1), 0.01);
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento);
-			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * gainNorm * playGate * ampEnv);
+			sig = [sig[0], sig[1]] * (modeGain * gainNorm * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
 			SendReply.kr(Impulse.kr(30), cmdName: '/elasticat/statusRaw', values: [
 				3, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
@@ -385,7 +424,7 @@ Engine_Elasticat : CroneEngine {
 			playGate = Lag.kr(playing.clip(0, 1), 0.01);
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento);
-			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * gainNorm * playGate * ampEnv);
+			sig = [sig[0], sig[1]] * (modeGain * gainNorm * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
 			SendReply.kr(Impulse.kr(30), cmdName: '/elasticat/statusRaw', values: [
 				4, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
@@ -419,7 +458,7 @@ Engine_Elasticat : CroneEngine {
 			playGate = Lag.kr(playing.clip(0, 1), 0.01);
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento);
-			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * playGate * ampEnv);
+			sig = [sig[0], sig[1]] * (modeGain * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
 			SendReply.kr(Impulse.kr(30), cmdName: '/elasticat/statusRaw', values: [
 				5, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
@@ -511,10 +550,74 @@ Engine_Elasticat : CroneEngine {
 				Select.ar(warpMode.clip(0, 5), [raw[0], raw[0], raw[0], grain[0], ola[0], pc[0]]),
 				Select.ar(warpMode.clip(0, 5), [raw[1], raw[1], raw[1], grain[1], ola[1], pc[1]])
 			];
-			playAmp = amp.max(0) * velocity.clip(0, 1) * env;
-			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), playAmp);
+			// Track pan + volume are applied downstream at the filter output stage;
+			// the voice keeps only velocity and its per-note envelope.
+			playAmp = velocity.clip(0, 1) * env;
+			sig = [sig[0], sig[1]] * playAmp;
 			sig = LeakDC.ar(sig);
 			Out.ar(out, sig);
+		}).add;
+
+		// --- Filter machines (global, post-mix) --------------------------------
+		// Each reads the summed voices off fxBus, applies pre-filter drive, an
+		// env-modulated cutoff (filter env reuses the shared readerAmpEnv graph
+		// with its own independent params/mode), then the master pan + track vol
+		// at the very end of the chain -> master out. New machines are added by
+		// appending a SynthDef here and its name to filterSynthNames.
+		//
+		// Classic: Type morphs LP/HP/BP/notch by index (p-lockable Type).
+		SynthDef(\elasticatFilterClassic, {
+			arg out=0, in=0, amp=0.8, pan=0,
+			filterType=0, cutoff=20000, res=0, drive=0, morph=0, balance=0,
+			envMode=1, envAttack=0.0001, envDecay=0.15, envSustain=0.8, envRelease=0.0001, envHold=1000000,
+			envDepth=0, envTrig=0, envGateSeconds=0.5;
+			var sig, fenv, fc, rq, driven, filtered;
+			sig = In.ar(in, 2);
+			driven = (sig * (1 + (drive.clip(0, 1) * 12))).tanh;
+			sig = XFade2.ar(sig, driven, (drive.clip(0, 1) * 2) - 1);
+			fenv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, 0);
+			// Depth is +/-6 octaves (72 semitones) of cutoff modulation.
+			fc = (Lag.kr(cutoff.clip(20, 20000), 0.01) * (envDepth.clip(-1, 1) * fenv * 72).midiratio).clip(20, 20000);
+			rq = Lag.kr((1 - (res.clip(0, 1) * 0.98)).clip(0.02, 1), 0.01);
+			filtered = [0, 1].collect({ arg ch;
+				var s, lp, hp, bp;
+				s = sig[ch];
+				lp = RLPF.ar(s, fc, rq);
+				hp = RHPF.ar(s, fc, rq);
+				bp = BPF.ar(s, fc, rq);
+				Select.ar(filterType.clip(0, 3), [lp, hp, bp, s - bp]);
+			});
+			filtered = Balance2.ar(filtered[0], filtered[1], pan.clip(-1, 1), amp.max(0));
+			Out.ar(out, LeakDC.ar(filtered));
+		}).add;
+
+		// Morphing: one Morph knob sweeps LP -> notch -> HP (p-lockable Morph).
+		SynthDef(\elasticatFilterMorph, {
+			arg out=0, in=0, amp=0.8, pan=0,
+			filterType=0, cutoff=20000, res=0, drive=0, morph=0, balance=0,
+			envMode=1, envAttack=0.0001, envDecay=0.15, envSustain=0.8, envRelease=0.0001, envHold=1000000,
+			envDepth=0, envTrig=0, envGateSeconds=0.5;
+			var sig, fenv, fc, rq, driven, filtered, m;
+			sig = In.ar(in, 2);
+			driven = (sig * (1 + (drive.clip(0, 1) * 12))).tanh;
+			sig = XFade2.ar(sig, driven, (drive.clip(0, 1) * 2) - 1);
+			fenv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, 0);
+			fc = (Lag.kr(cutoff.clip(20, 20000), 0.01) * (envDepth.clip(-1, 1) * fenv * 72).midiratio).clip(20, 20000);
+			rq = Lag.kr((1 - (res.clip(0, 1) * 0.98)).clip(0.02, 1), 0.01);
+			m = Lag.kr(morph.clip(0, 1), 0.02);
+			filtered = [0, 1].collect({ arg ch;
+				var s, lp, hp, bp, notch, lowHalf, highHalf;
+				s = sig[ch];
+				lp = RLPF.ar(s, fc, rq);
+				hp = RHPF.ar(s, fc, rq);
+				bp = BPF.ar(s, fc, rq);
+				notch = s - bp;
+				lowHalf = XFade2.ar(lp, notch, m.linlin(0, 0.5, -1, 1).clip(-1, 1));
+				highHalf = XFade2.ar(notch, hp, m.linlin(0.5, 1, -1, 1).clip(-1, 1));
+				Select.ar(m >= 0.5, [lowHalf, highHalf]);
+			});
+			filtered = Balance2.ar(filtered[0], filtered[1], pan.clip(-1, 1), amp.max(0));
+			Out.ar(out, LeakDC.ar(filtered));
 		}).add;
 	}
 
@@ -553,7 +656,7 @@ Engine_Elasticat : CroneEngine {
 			playGate = Lag.kr(playing.clip(0, 1), 0.01);
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento);
-			sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), amp.max(0) * modeGain * playGate * ampEnv);
+			sig = [sig[0], sig[1]] * (modeGain * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
 			SendReply.kr(Impulse.kr(30), cmdName: '/elasticat/statusRaw', values: [
 				modeId, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
@@ -602,10 +705,12 @@ Engine_Elasticat : CroneEngine {
 			if(msg[1] < 0, { direction = -1; }, { direction = 1; });
 			this.setActive(\direction, direction);
 		});
-		this.addCommand(\setAmp, "f", { arg msg; amp = msg[1].max(0); this.setActive(\amp, amp); });
-		this.addCommand(\amp, "f", { arg msg; amp = msg[1].max(0); this.setActive(\amp, amp); });
-		this.addCommand(\setPan, "f", { arg msg; pan = msg[1].clip(-1, 1); this.setActive(\pan, pan); });
-		this.addCommand(\pan, "f", { arg msg; pan = msg[1].clip(-1, 1); this.setActive(\pan, pan); });
+		// Track volume + pan now live at the end of the chain, on the filter
+		// output stage, so they mix the whole (filtered) track rather than each voice.
+		this.addCommand(\setAmp, "f", { arg msg; amp = msg[1].max(0); this.setFilter(\amp, amp); });
+		this.addCommand(\amp, "f", { arg msg; amp = msg[1].max(0); this.setFilter(\amp, amp); });
+		this.addCommand(\setPan, "f", { arg msg; pan = msg[1].clip(-1, 1); this.setFilter(\pan, pan); });
+		this.addCommand(\pan, "f", { arg msg; pan = msg[1].clip(-1, 1); this.setFilter(\pan, pan); });
 		this.addCommand(\syncClock, "ffi", { arg msg; this.syncClock(msg[1], msg[2], msg[3]); });
 		this.addCommand(\setPlayhead, "f", { arg msg; this.setPlayhead(msg[1]); });
 		this.addCommand(\playhead, "f", { arg msg; this.setPlayhead(msg[1]); });
@@ -651,10 +756,33 @@ Engine_Elasticat : CroneEngine {
 			if(activeSynth.notNil, {
 				activeSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
 			});
+			// The global filter env shares the trigger counter, so it retriggers on
+			// the same note-ons as the amp env (one shared env across slice voices).
+			if(filterSynth.notNil, {
+				filterSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
+			});
 		});
 		this.addCommand(\setSliceMono, "i", { arg msg; sliceMono = msg[1].asInteger.clip(0, 1); });
 		this.addCommand(\setSliceSyncToClock, "i", { arg msg; sliceSyncToClock = msg[1].asInteger.clip(0, 1); });
 		this.addCommand(\setSliceRate, "f", { arg msg; sliceRate = msg[1].clip(0.03125, 16); });
+
+		// --- Filter -----------------------------------------------------------
+		// Machine is a setting (respawns the filter synth); everything else is a
+		// live/p-lockable set on the running filter synth.
+		this.addCommand(\setFilterMachine, "i", { arg msg; this.setFilterMachine(msg[1]); });
+		this.addCommand(\filterType, "i", { arg msg; filterType = msg[1].asInteger.clip(0, 3); this.setFilter(\filterType, filterType); });
+		this.addCommand(\filterCutoff, "f", { arg msg; filterCutoff = msg[1].clip(20, 20000); this.setFilter(\cutoff, filterCutoff); });
+		this.addCommand(\filterRes, "f", { arg msg; filterRes = msg[1].clip(0, 1); this.setFilter(\res, filterRes); });
+		this.addCommand(\filterDrive, "f", { arg msg; filterDrive = msg[1].clip(0, 1); this.setFilter(\drive, filterDrive); });
+		this.addCommand(\filterMorph, "f", { arg msg; filterMorph = msg[1].clip(0, 1); this.setFilter(\morph, filterMorph); });
+		this.addCommand(\filterBalance, "f", { arg msg; filterBalance = msg[1].clip(-1, 1); this.setFilter(\balance, filterBalance); });
+		this.addCommand(\filterEnvMode, "i", { arg msg; filterEnvMode = msg[1].asInteger.clip(0, 1); this.setFilter(\envMode, filterEnvMode); });
+		this.addCommand(\filterEnvAttack, "f", { arg msg; filterEnvAttack = msg[1].max(0); this.setFilter(\envAttack, filterEnvAttack); });
+		this.addCommand(\filterEnvDecay, "f", { arg msg; filterEnvDecay = msg[1].max(0); this.setFilter(\envDecay, filterEnvDecay); });
+		this.addCommand(\filterEnvSustain, "f", { arg msg; filterEnvSustain = msg[1].clip(0, 1); this.setFilter(\envSustain, filterEnvSustain); });
+		this.addCommand(\filterEnvRelease, "f", { arg msg; filterEnvRelease = msg[1].max(0); this.setFilter(\envRelease, filterEnvRelease); });
+		this.addCommand(\filterEnvHold, "f", { arg msg; filterEnvHold = msg[1].max(0); this.setFilter(\envHold, filterEnvHold); });
+		this.addCommand(\filterEnvDepth, "f", { arg msg; filterEnvDepth = msg[1].clip(-1, 1); this.setFilter(\envDepth, filterEnvDepth); });
 	}
 
 	spawnMode { arg modeIndex, startAmp;
@@ -662,14 +790,14 @@ Engine_Elasticat : CroneEngine {
 		if(transportSynth.notNil, {
 			synth = Synth.after(transportSynth, modeSynthNames.wrapAt(modeIndex.asInteger), this.commonArgs(startAmp));
 		}, {
-			synth = Synth.tail(context.xg, modeSynthNames.wrapAt(modeIndex.asInteger), this.commonArgs(startAmp));
+			synth = Synth.tail(sourceGroup, modeSynthNames.wrapAt(modeIndex.asInteger), this.commonArgs(startAmp));
 		});
 		^synth;
 	}
 
 	commonArgs { arg startAmp;
 		^[
-			\out, context.out_b.index,
+			\out, fxBus.index,
 			\phaseBus, phaseBus.index,
 			\bufL, bufL.bufnum,
 			\bufR, bufR.bufnum,
@@ -705,6 +833,49 @@ Engine_Elasticat : CroneEngine {
 		if(activeSynth.notNil, {
 			activeSynth.set(key, value);
 		});
+	}
+
+	setFilter { arg key, value;
+		if(filterSynth.notNil, {
+			filterSynth.set(key, value);
+		});
+	}
+
+	filterArgs {
+		^[
+			\out, context.out_b.index,
+			\in, fxBus.index,
+			\amp, amp,
+			\pan, pan,
+			\filterType, filterType,
+			\cutoff, filterCutoff,
+			\res, filterRes,
+			\drive, filterDrive,
+			\morph, filterMorph,
+			\balance, filterBalance,
+			\envMode, filterEnvMode,
+			\envAttack, filterEnvAttack,
+			\envDecay, filterEnvDecay,
+			\envSustain, filterEnvSustain,
+			\envRelease, filterEnvRelease,
+			\envHold, filterEnvHold,
+			\envDepth, filterEnvDepth,
+			\envTrig, envTrigCount,
+			\envGateSeconds, envNoteSeconds
+		];
+	}
+
+	// Spawn (or respawn) the global filter at the tail of filterGroup, seeded with
+	// current state so a machine change is seamless.
+	spawnFilter {
+		if(filterSynth.notNil, { filterSynth.free; });
+		filterSynth = Synth.tail(filterGroup, filterSynthNames.wrapAt(filterMachine.asInteger), this.filterArgs);
+		^filterSynth;
+	}
+
+	setFilterMachine { arg idx;
+		filterMachine = idx.asInteger.clip(0, filterSynthNames.size - 1);
+		this.spawnFilter;
 	}
 
 	applyGlobals { arg synth;
@@ -781,8 +952,8 @@ Engine_Elasticat : CroneEngine {
 			activeSliceSynths[idx - 1].set(\gate, 0);
 		});
 
-		synth = Synth.tail(context.xg, \elasticatSliceVoice, [
-			\out, context.out_b.index,
+		synth = Synth.tail(sourceGroup, \elasticatSliceVoice, [
+			\out, fxBus.index,
 			\bufL, bufL.bufnum,
 			\bufR, bufR.bufnum,
 			\startPoint, startPos,
@@ -1235,7 +1406,10 @@ Engine_Elasticat : CroneEngine {
 		if(transportResponder.notNil, { transportResponder.free; });
 		if(previewSynth.notNil, { previewSynth.free; });
 		if(activeSynth.notNil, { activeSynth.free; });
+		if(filterSynth.notNil, { filterSynth.free; });
 		if(transportSynth.notNil, { transportSynth.free; });
+		if(filterGroup.notNil, { filterGroup.free; });
+		if(sourceGroup.notNil, { sourceGroup.free; });
 		if(poolBufL.notNil, {
 			poolBufL.do({ arg buffer, i;
 				if(buffer.notNil, { buffer.free; });
@@ -1245,5 +1419,6 @@ Engine_Elasticat : CroneEngine {
 		if(defaultBufL.notNil, { defaultBufL.free; });
 		if(defaultBufR.notNil and: { defaultBufR != defaultBufL }, { defaultBufR.free; });
 		if(phaseBus.notNil, { phaseBus.free; });
+		if(fxBus.notNil, { fxBus.free; });
 	}
 }

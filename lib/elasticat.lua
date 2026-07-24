@@ -11,6 +11,7 @@
 
 local cs = require "controlspec"
 local unpack = table.unpack or unpack
+local FilterRegistry = include("lib/filter_modes/registry")
 
 local elasticat = {}
 
@@ -322,8 +323,49 @@ local function format_pan_127(param)
   return (v < 0 and "L" or "R") .. tostring(math.abs(v))
 end
 
+-- Filter cutoff: a 0-127 amount mapped exponentially across the audible range so
+-- each step is a roughly constant musical interval. 0 -> 20 Hz, 127 -> 20 kHz.
+local FILTER_CUTOFF_MIN = 20
+local FILTER_CUTOFF_MAX = 20000
+local function filter_cutoff_hz(v)
+  local n = util.clamp((v or 0) / 127, 0, 1)
+  return FILTER_CUTOFF_MIN * ((FILTER_CUTOFF_MAX / FILTER_CUTOFF_MIN) ^ n)
+end
+
+local function format_filter_cutoff(param)
+  local hz = filter_cutoff_hz(param:get())
+  if hz >= 1000 then
+    return string.format("%.1fk", hz / 1000)
+  end
+  return string.format("%d", math.floor(hz + 0.5))
+end
+
+-- Filter type: 4-way multimode selector (Classic machines).
+local FILTER_TYPE_LABELS = {"LP", "HP", "BP", "NOTCH"}
+local function format_filter_type(param)
+  return FILTER_TYPE_LABELS[math.floor(param:get() + 0.5)] or "LP"
+end
+
+-- Morph: centered 0-128. 0 = full low-pass, 64 = notch, 128 = full high-pass.
+local function format_filter_morph(param)
+  local v = math.floor(param:get() + 0.5)
+  if v == 64 then return "NOTCH" end
+  if v < 64 then
+    return "LP" .. tostring(math.floor(((64 - v) / 64 * 100) + 0.5))
+  end
+  return "HP" .. tostring(math.floor(((v - 64) / 64 * 100) + 0.5))
+end
+
+-- Env depth: bipolar 0-128 (64 = no modulation), shown as a signed percentage.
+local function format_filter_depth(param)
+  local v = math.floor(param:get() + 0.5) - 64
+  if v == 0 then return "0" end
+  return string.format("%+d%%", math.floor((v / 64 * 100) + 0.5))
+end
+
 -- resend_env_times is defined after queue_engine_call (below) so it can use it.
 local resend_env_times
+local resend_filter_env_times
 
 local function clock_param_is_internal()
   return params:lookup_param("clock_source") ~= nil and params:get("clock_source") == 1
@@ -548,6 +590,18 @@ resend_env_times = function()
   queue_engine_call(ids.env_hold, "envHold", env_value_to_seconds(params:get(ids.env_hold)))
 end
 
+-- The filter envelope shares the amp's seconds mapping (env_range), so a range
+-- change must re-send the filter env times too.
+resend_filter_env_times = function()
+  if ids.filter_env_attack == nil or params:lookup_param(ids.filter_env_attack) == nil then
+    return
+  end
+  queue_engine_call(ids.filter_env_attack, "filterEnvAttack", env_value_to_seconds(params:get(ids.filter_env_attack)))
+  queue_engine_call(ids.filter_env_decay, "filterEnvDecay", env_value_to_seconds(params:get(ids.filter_env_decay)))
+  queue_engine_call(ids.filter_env_release, "filterEnvRelease", env_value_to_seconds(params:get(ids.filter_env_release)))
+  queue_engine_call(ids.filter_env_hold, "filterEnvHold", env_value_to_seconds(params:get(ids.filter_env_hold)))
+end
+
 -- Coalesced (12Hz) version of update_engine_loop_points -- used when re-mapping
 -- the loop points from a rapidly-scrubbed control (Range) during playback, so
 -- per-detent edits don't flood the engine with immediate sends and feel laggy.
@@ -738,6 +792,29 @@ function elasticat.sync_amp_env()
   if ids.pan ~= nil then
     engine_call("setPan", ((params:get(ids.pan) or 64) - 64) / 64)
   end
+end
+
+-- Push the filter params to the engine on init (same reasoning as sync_amp_env:
+-- actions are set after add, so defaults never fire, and old psets lack them).
+-- Params are sent first, then the machine is (re)selected last so its respawn
+-- seeds from the now-current engine-side values.
+function elasticat.sync_filter()
+  if ids.filter_machine == nil or params:lookup_param(ids.filter_machine) == nil then
+    return
+  end
+  engine_call("filterType", (params:get(ids.filter_type) or 1) - 1)
+  engine_call("filterCutoff", filter_cutoff_hz(params:get(ids.filter_cutoff)))
+  engine_call("filterRes", util.clamp((params:get(ids.filter_res) or 0) / 127, 0, 1))
+  engine_call("filterDrive", util.clamp((params:get(ids.filter_drive) or 0) / 127, 0, 1))
+  engine_call("filterMorph", util.clamp((params:get(ids.filter_morph) or 64) / 128, 0, 1))
+  engine_call("filterEnvMode", (params:get(ids.filter_env_mode) or 2) - 1)
+  engine_call("filterEnvAttack", env_value_to_seconds(params:get(ids.filter_env_attack)))
+  engine_call("filterEnvDecay", env_value_to_seconds(params:get(ids.filter_env_decay)))
+  engine_call("filterEnvSustain", util.clamp((params:get(ids.filter_env_sustain) or 100) / 127, 0, 1))
+  engine_call("filterEnvRelease", env_value_to_seconds(params:get(ids.filter_env_release)))
+  engine_call("filterEnvHold", env_value_to_seconds(params:get(ids.filter_env_hold)))
+  engine_call("filterEnvDepth", ((params:get(ids.filter_env_depth) or 64) - 64) / 64)
+  engine_call("setFilterMachine", (params:get(ids.filter_machine) or 1) - 1)
 end
 
 function elasticat.release_slice(slice_index)
@@ -1064,6 +1141,19 @@ function elasticat.params(options)
   ids.env_mode = param_id(prefix, "env_mode")
   ids.env_range = param_id(prefix, "env_range")
   ids.portamento = param_id(prefix, "portamento")
+  ids.filter_machine = param_id(prefix, "filter_machine")
+  ids.filter_type = param_id(prefix, "filter_type")
+  ids.filter_cutoff = param_id(prefix, "filter_cutoff")
+  ids.filter_res = param_id(prefix, "filter_res")
+  ids.filter_drive = param_id(prefix, "filter_drive")
+  ids.filter_morph = param_id(prefix, "filter_morph")
+  ids.filter_env_mode = param_id(prefix, "filter_env_mode")
+  ids.filter_env_attack = param_id(prefix, "filter_env_attack")
+  ids.filter_env_decay = param_id(prefix, "filter_env_decay")
+  ids.filter_env_sustain = param_id(prefix, "filter_env_sustain")
+  ids.filter_env_release = param_id(prefix, "filter_env_release")
+  ids.filter_env_hold = param_id(prefix, "filter_env_hold")
+  ids.filter_env_depth = param_id(prefix, "filter_env_depth")
 
   local function apply_current_mode_params()
     local mode = params:get(ids.mode)
@@ -1230,7 +1320,10 @@ function elasticat.params(options)
 
   params:add_option(ids.env_range, "envelope range",
     {"1s", "4s", "8s", "16s", "32s", "64s", "128s", "256s", "512s", "1024s"}, 3)
-  params:set_action(ids.env_range, function(_) resend_env_times() end)
+  params:set_action(ids.env_range, function(_)
+    resend_env_times()
+    resend_filter_env_times()
+  end)
 
   -- Portamento (mono overlap): off = a new trigger re-attacks; on = an
   -- overlapping trigger glides without re-attacking the amp envelope.
@@ -1485,6 +1578,83 @@ function elasticat.params(options)
   params:add_binary(param_id(prefix, "loop_reverse"), "loop reverse", "toggle", 0)
   params:set_action(param_id(prefix, "loop_reverse"), function(x)
     queue_engine_call(param_id(prefix, "loop_reverse"), "setReverse", x)
+  end)
+
+  params:add_group(param_id(prefix, "group_filter"), "filter", 13)
+
+  -- Filter machine is a setting (respawns the engine's filter synth), not
+  -- p-lockable. Machine index -> engine 0-based.
+  params:add_option(ids.filter_machine, "filter machine", FilterRegistry.names(), 1)
+  params:set_action(ids.filter_machine, function(x)
+    queue_engine_call(ids.filter_machine, "setFilterMachine", x - 1)
+  end)
+
+  -- Type: 4-way multimode (Classic machines). Option 1-4 -> engine 0-3.
+  params:add_option(ids.filter_type, "filter type", FILTER_TYPE_LABELS, 1)
+  params:set_action(ids.filter_type, function(x)
+    queue_engine_call(ids.filter_type, "filterType", x - 1)
+  end)
+
+  -- Cutoff / Res / Drive are 0-127 amounts. Cutoff maps exponentially to Hz;
+  -- Res and Drive map linearly to 0..1 in the engine.
+  add_control(ids.filter_cutoff, "filter cutoff",
+    cs.new(0, 127, "lin", 1, 127, "", 1 / 127),
+    function(x) queue_engine_call(ids.filter_cutoff, "filterCutoff", filter_cutoff_hz(x)) end,
+    format_filter_cutoff)
+
+  add_control(ids.filter_res, "filter resonance",
+    cs.new(0, 127, "lin", 1, 0, "", 1 / 127),
+    function(x) queue_engine_call(ids.filter_res, "filterRes", util.clamp(x / 127, 0, 1)) end,
+    format_env_level)
+
+  add_control(ids.filter_drive, "filter drive",
+    cs.new(0, 127, "lin", 1, 0, "", 1 / 127),
+    function(x) queue_engine_call(ids.filter_drive, "filterDrive", util.clamp(x / 127, 0, 1)) end,
+    format_env_level)
+
+  -- Morph: centered 0-128 (Morphing machines). 0 LP -> 64 notch -> 128 HP,
+  -- sent to the engine as 0..1.
+  add_control(ids.filter_morph, "filter morph",
+    cs.new(0, 128, "lin", 1, 64, "", 1 / 128),
+    function(x) queue_engine_call(ids.filter_morph, "filterMorph", util.clamp(x / 128, 0, 1)) end,
+    format_filter_morph)
+
+  -- Filter envelope: independent mode from the amp env, but reuses the amp's
+  -- seconds mapping (env_range) for its times. Whole envelope is p-lockable.
+  add_control(ids.filter_env_attack, "filter env attack",
+    cs.new(0, 127, "lin", 1, 0, "", 1 / 127),
+    function(x) queue_engine_call(ids.filter_env_attack, "filterEnvAttack", env_value_to_seconds(x)) end,
+    format_env_time)
+
+  add_control(ids.filter_env_decay, "filter env decay",
+    cs.new(0, 127, "lin", 1, 64, "", 1 / 127),
+    function(x) queue_engine_call(ids.filter_env_decay, "filterEnvDecay", env_value_to_seconds(x)) end,
+    format_env_time)
+
+  add_control(ids.filter_env_sustain, "filter env sustain",
+    cs.new(0, 127, "lin", 1, 100, "", 1 / 127),
+    function(x) queue_engine_call(ids.filter_env_sustain, "filterEnvSustain", util.clamp(x / 127, 0, 1)) end,
+    format_env_level)
+
+  add_control(ids.filter_env_release, "filter env release",
+    cs.new(0, 128, "lin", 1, 0, "", 1 / 128),
+    function(x) queue_engine_call(ids.filter_env_release, "filterEnvRelease", env_value_to_seconds(x)) end,
+    format_env_time)
+
+  add_control(ids.filter_env_hold, "filter env hold",
+    cs.new(0, 128, "lin", 1, 128, "", 1 / 128),
+    function(x) queue_engine_call(ids.filter_env_hold, "filterEnvHold", env_value_to_seconds(x)) end,
+    format_env_time)
+
+  -- Depth: bipolar 0-128 (64 = no modulation) -> engine -1..1 (+/-6 octaves).
+  add_control(ids.filter_env_depth, "filter env depth",
+    cs.new(0, 128, "lin", 1, 64, "", 1 / 128),
+    function(x) queue_engine_call(ids.filter_env_depth, "filterEnvDepth", (x - 64) / 64) end,
+    format_filter_depth)
+
+  params:add_option(ids.filter_env_mode, "filter envelope mode", {"ADSR", "AHR"}, 2)
+  params:set_action(ids.filter_env_mode, function(x)
+    queue_engine_call(ids.filter_env_mode, "filterEnvMode", x - 1)  -- 0 = ADSR, 1 = AHR
   end)
 
   params:add_group(param_id(prefix, "group_engine_modes"), "engine algorithms", 13)

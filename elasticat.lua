@@ -7,6 +7,7 @@ local ParamRenderer = include("lib/ui/param_renderer")
 local Header = include("lib/ui/header")
 local MachineRegistry = include("lib/machines/registry")
 local WarpRegistry = include("lib/warp_modes/registry")
+local FilterRegistry = include("lib/filter_modes/registry")
 local WavReader = include("lib/wav_reader")
 local ScriptState = include("lib/script_state")
 local Navigation = include("lib/pages/navigation")
@@ -240,6 +241,39 @@ local function amp_env_items()
   return items
 end
 
+-- FILTER page 1: the active machine's p-lockable macro row (Type/Cutoff/Res/
+-- Drive, or Morph/... etc). Machine is a setting, so this list changes when the
+-- filter machine changes -- same dynamic pattern as the WARP page.
+local function filter_machine_items()
+  return FilterRegistry.source_items(param_value_or("filter_machine", 1), ParamItem)
+end
+
+-- FILTER page 2: the filter envelope, laid out by its (independent) mode -- ADSR
+-- or AHR -- with DEPTH (cutoff modulation amount) on the bottom row.
+local function filter_env_items()
+  local items
+  if param_value_or("filter_env_mode", 2) == 1 then  -- ADSR
+    items = {
+      ParamItem.item("filter_env_attack", "ATK", {lockable = true, min = 0, max = 127, step = 1}),
+      ParamItem.item("filter_env_decay", "DEC", {lockable = true, min = 0, max = 127, step = 1}),
+      ParamItem.item("filter_env_sustain", "SUS", {lockable = true, min = 0, max = 127, step = 1}),
+      ParamItem.item("filter_env_release", "REL", {lockable = true, min = 0, max = 128, step = 1})
+    }
+  else  -- AHR (default)
+    items = {
+      ParamItem.item("filter_env_attack", "ATK", {lockable = true, min = 0, max = 127, step = 1}),
+      ParamItem.item("filter_env_hold", "HOLD", {lockable = true, min = 0, max = 128, step = 1}),
+      ParamItem.item("filter_env_release", "REL", {lockable = true, min = 0, max = 128, step = 1}),
+      ParamItem.blank()
+    }
+  end
+  table.insert(items, ParamItem.item("filter_env_depth", "DPTH", {lockable = true, min = 0, max = 128, step = 1}))
+  table.insert(items, ParamItem.blank())
+  table.insert(items, ParamItem.blank())
+  table.insert(items, ParamItem.blank())
+  return items
+end
+
 -- TRIG page 2 (machine trig): behavior params that only apply to the loop
 -- machines' continuous playhead -- empty for slice machines.
 local function trig_machine_items()
@@ -255,6 +289,10 @@ end
 local function page_items_for(category, page, page_index)
   if category == "amp" and page_index == 1 then
     return amp_env_items()
+  elseif category == "filter" and page_index == 1 then
+    return filter_machine_items()
+  elseif category == "filter" and page_index == 2 then
+    return filter_env_items()
   elseif category == "trig" and page_index == 2 then
     return trig_machine_items()
   elseif category == "source" and page_index == 1 then
@@ -1059,6 +1097,7 @@ function init()
 
   set_playing(false, true)
   elasticat.sync_amp_env()  -- push env/pan/vol defaults (their actions don't fire on add)
+  elasticat.sync_filter()   -- push filter machine/params defaults (same reasoning)
   start_intro()
   start_redraw_metro()
   redraw()
